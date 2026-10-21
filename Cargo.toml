@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/cosmo-rollback"]
+
+[profile.release]
+# Match the build characteristics rollback care about (small, fast, aborting).
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

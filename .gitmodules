@@ -1,0 +1,9 @@
+[submodule "reference/ShieldBattery"]
+	path = reference/ShieldBattery
+	url = https://github.com/ShieldBattery/ShieldBattery.git
+[submodule "reference/CrownLink"]
+	path = reference/CrownLink
+	url = https://github.com/impromptu1583/CrownLink.git
+[submodule "reference/cosmonarchy-gptp"]
+	path = reference/cosmonarchy-gptp
+	url = https://gitlab.com/the-no-frauds-club/tools/cosmonarchy-gptp.git

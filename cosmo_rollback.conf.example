@@ -1,0 +1,40 @@
+# cosmo_rollback.conf — arm the rollback plugin
+#
+# Copy this file to the game's directory (next to `Cosmonarchy BW.exe`) as
+# `cosmo_rollback.conf`, or to `plugins/cosmo_rollback.conf`. Every line is `KEY=value`;
+# `#` starts a comment. Only keys starting with `CM_ROLLBACK_` are accepted.
+#
+# The plugin is INERT unless armed, so an unmodified game behaves exactly as before.
+#
+# ---- playing a match with rollback -------------------------------------------------
+#
+# Only for a real multiplayer match (both players must run the same plugin and a
+# rollback-capable CrownLink.snp — see tools/install-crownlink.sh). Do NOT arm this for
+# a replay or a single-player game: the client waits for a peer and would pass the
+# frames through doing nothing.
+#
+# CM_ROLLBACK_SLOT  0 = host (session creator), 1 = guest
+#CM_ROLLBACK_LIVE=1
+#CM_ROLLBACK_SLOT=0
+#
+# How many steps may run on prediction before the client stalls waiting for the peer.
+#CM_ROLLBACK_PREDICT=8
+#
+# ---- diagnostics -------------------------------------------------------------------
+#
+# The shadow gate: re-simulate a frame and report state a restore did not reproduce.
+#CM_ROLLBACK_SHADOW=1
+#CM_ROLLBACK_SNAPSHOT_SPACING=1
+#CM_ROLLBACK_SHADOW_START=95
+#
+# Harness only: a scripted peer, so the loop runs without a second machine.
+#CM_ROLLBACK_SCRIPT_PEER=1
+#CM_ROLLBACK_SCRIPT_REMOTE=37 00 00 00 00 00 00
+#CM_ROLLBACK_SCRIPT_DELAY=2
+#
+# Isolation knobs (bisecting the state table).
+#CM_ROLLBACK_NO_PLUGIN=1
+#CM_ROLLBACK_NO_POOLS=1
+#CM_ROLLBACK_NO_RELOC_ARRAYS=1
+#CM_ROLLBACK_SCRATCH=1
+#CM_ROLLBACK_POOL_RENDER=1

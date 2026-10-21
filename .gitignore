@@ -1,0 +1,16 @@
+# build output
+target/
+dist/
+out/
+build/
+
+# local analysis scratch
+*.dmp
+*.obj
+*.o
+*.pdb
+*.ilk
+*.log
+
+# keep
+!docs/**

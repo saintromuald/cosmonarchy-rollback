@@ -1,0 +1,32 @@
+[package]
+name = "cosmo-rollback"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "cosmo_rollback"
+crate-type = ["cdylib"]
+
+[dependencies]
+# StarCraft 1.16.1 struct/data layer (v116 layout: do NOT enable `scr-only`).
+bw_dat = { git = "https://github.com/neivv/aise.git", rev = "da4fed681dc09bda7a21c0051f60cdad98cc7226" }
+# 1.16.1 plugin surface: resolves globals/functions, wraps `whack`, provides the
+# per-frame hook boundary. Mirrors how `aise` integrates.
+samase_shim = { git = "https://github.com/neivv/samase_plugin", rev = "c01a88f00b1aaf6286f96940b0f04498cea6c7b7" }
+# Function hooking (we install our own StepObjects trampoline so we can call `orig`).
+whack = { git = "https://github.com/neivv/whack.git", rev = "03a8b0db17c40913b845987e0fe6ed0cdd8e71eb" }
+
+once_cell = "1.7"
+
+[dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+]
