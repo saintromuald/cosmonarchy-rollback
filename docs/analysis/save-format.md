@@ -87,5 +87,23 @@ a save cannot fix that. What a confirmed-frame save *does* give:
 - `tools/test.sh`: 49 unit tests pass, including writer/reader round trips, file
   checksum/magic rejection, pruning, and a full `Session` save → load → dispatch
   identity test.
-- `tools/save-gate.sh`: see the run logs; the gate passes when every frame reports
-  `SAVEGATE ok` and the one-shot save reports `saveverify ok`.
+- `tools/save-gate.sh`: **PASS on the real game** (build 8421086, 2026-10-22):
+  every gate frame reports `SAVEGATE ok` — a snapshot serialized to the format,
+  written to disk, read back, deserialized, restored and re-simulated reproduces the
+  live state exactly — and the one-shot full save re-reads as `saveverify ok`
+  (5.5 MB, hash-identical). The gate run ignores `sprite_count` (the draw pass
+  allocates and frees helper sprites between frames; ADR-0007) and was run with
+  `aise.qdp` removed, because its unsnapshotted heap state (Layer B, out of v1 scope)
+  makes *any* re-simulation — including the plain shadow gate — diverge in
+  `ai_script_pool`/`ai_town_pool`/`first_ai_script` on AI replays. Both residuals
+  were confirmed to be the pre-existing engine classes, not the save format: the
+  plain shadow gate shows the same divergences, and every `SAVEGATE DIVERGENCE`
+  names only those ranges.
+
+## Navigating the current menus (harness note)
+
+Build 8421086 with `fastmenus` changed the click path: Single Player → a "Registry"
+profile dialog (Enter accepts the default) → Watch Replay → select
+`LastReplay.rep` → double-click starts it. `tools/headless_probe.sh` now supports
+`key:<name>` and `x,y,2` (double-click) entries in the click list, backward
+compatibly; `save-gate.sh` carries the current path.

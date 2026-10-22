@@ -42,9 +42,23 @@ if [ "$CX" != "none" ]; then
     IFS=';' read -ra CLICKS <<< "$CX"
     for c in "${CLICKS[@]}"; do
         [ "$c" = "none" ] && continue
-        x="${c%,*}"
-        y="${c#*,}"
-        DISPLAY="$DISPLAY_NUM" xdotool mousemove "$x" "$y" click 1
+        # `key:<name>` sends a key press (e.g. key:Return); `x,y,2` is a double-click.
+        # Plain `x,y` stays a single click, exactly as before.
+        if [[ "$c" == key:* ]]; then
+            DISPLAY="$DISPLAY_NUM" xdotool key "${c#key:}"
+            sleep 2
+            continue
+        fi
+        x="${c%%,*}"
+        rest="${c#*,}"
+        y="${rest%%,*}"
+        n="${rest#"$y"}"
+        n="${n#,}"
+        if [ "$n" = "2" ]; then
+            DISPLAY="$DISPLAY_NUM" xdotool mousemove "$x" "$y" click --repeat 2 --delay 60 1
+        else
+            DISPLAY="$DISPLAY_NUM" xdotool mousemove "$x" "$y" click 1
+        fi
         sleep 5
     done
 fi
