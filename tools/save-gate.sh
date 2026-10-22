@@ -23,7 +23,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="${1:-Release}"
 DEPTH="${2:-3}"
 START="${3:-90}"
-CLICKS="${CM_GATE_CLICKS:-490,182;940,590;320,645;350,238;940,590}"
+# The click path through the menu. The first click dismisses the post-update "Registry"
+# profile dialog when it appears (its Cancel button sits at 895,606); on the normal
+# menu that point is empty space, so the click is harmless there. The rest are the
+# standard gate path: Single Player (490,182), replay list (940,590), pick the replay
+# (320,645), start (350,238), back to the game (940,590).
+CLICKS="${CM_GATE_CLICKS:-895,606;490,182;940,590;320,645;350,238;940,590}"
 BOOT="${CM_GATE_BOOT:-55}"
 POST="${CM_GATE_POST:-60}"
 LOG="$HOME/Games/cosmonarchy/prefix/drive_c/Cosmonarchy/$BUILD/cosmo_rollback.log"
