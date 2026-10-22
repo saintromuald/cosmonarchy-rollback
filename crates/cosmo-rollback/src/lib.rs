@@ -27,6 +27,7 @@ mod replay;
 mod session;
 mod rng_watch;
 mod rollback;
+mod savefile;
 mod snapshot;
 mod state_hash;
 mod tick;

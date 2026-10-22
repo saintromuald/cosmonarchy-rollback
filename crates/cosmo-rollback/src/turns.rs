@@ -461,6 +461,138 @@ impl InputTable {
     pub fn take_counts(&mut self) -> InputCounts {
         std::mem::take(&mut self.counts)
     }
+
+    /// Serialize the table for a mid-match save (see `savefile`).
+    ///
+    /// Everything that decides what later steps dispatch is saved: the tuning knobs,
+    /// the frontier and misprediction mark, the per-slot turn windows (including gaps
+    /// and each turn's lateness), the held delays and the leave schedule. The only thing
+    /// dropped is each held turn's `usable_at` wall-clock: a save is taken at a
+    /// *confirmed* step, so every turn up to it is already usable, and on load a still-
+    /// held turn is treated as usable at once (held delays are a testing knob, not match
+    /// state).
+    pub fn save_state(&self) -> Vec<u8> {
+        use crate::savefile::Writer;
+        let mut w = Writer::new();
+        w.u32(self.limit);
+        w.u32(self.rollback_target);
+        w.u32(self.lockstep_steps);
+        w.u32(self.min_buffer_turns);
+        w.u32(self.frontier);
+        w.opt_u32(self.mispredicted);
+        w.u32(self.counts.predicted_steps);
+        w.u32(self.counts.mispredicted_turns);
+        w.u32(self.counts.confirmed_predictions);
+        for held in &self.held {
+            w.u64(held.as_nanos() as u64);
+        }
+        for slot in &self.slots {
+            w.u32(slot.first);
+            w.u32(slot.usable as u32);
+            w.u32(slot.turns.len() as u32);
+            for t in &slot.turns {
+                w.flag(t.bytes.is_some());
+                if let Some(b) = &t.bytes {
+                    w.bytes(b);
+                }
+                w.u32(t.lateness);
+            }
+        }
+        for window in &self.lateness {
+            w.u32(window.len() as u32);
+            for &x in window {
+                w.u32(x);
+            }
+        }
+        w.u32(self.leaves.len() as u32);
+        for l in &self.leaves {
+            w.u32(l.storm as u32);
+            w.u32(l.reason);
+            w.u32(l.step);
+            w.flag(l.applied);
+        }
+        w.into_bytes()
+    }
+
+    /// Restore the table from [`save_state`](Self::save_state) bytes.
+    ///
+    /// The loader is bounds-checked and refuses nonsense (`MAX_SEQ_GAP` per-slot turns,
+    /// `SLOTS` leaves, capped lateness windows), so a corrupt or foreign save fails
+    /// loudly instead of poisoning the session.
+    pub fn load_state(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
+        use crate::savefile::Reader;
+        let mut r = Reader::new(bytes);
+        self.limit = r.u32()?;
+        self.rollback_target = r.u32()?;
+        self.lockstep_steps = r.u32()?;
+        self.min_buffer_turns = r.u32()?;
+        self.frontier = r.u32()?;
+        self.mispredicted = r.opt_u32()?;
+        self.counts = InputCounts {
+            predicted_steps: r.u32()?,
+            mispredicted_turns: r.u32()?,
+            confirmed_predictions: r.u32()?,
+        };
+        let mut held = [Duration::ZERO; SLOTS];
+        for h in held.iter_mut() {
+            let nanos = r.u64()?;
+            if nanos > 86_400_000_000_000 {
+                return Err("held delay out of range");
+            }
+            *h = Duration::from_nanos(nanos);
+        }
+        self.held = held;
+        for slot in self.slots.iter_mut() {
+            let first = r.u32()?;
+            let usable = r.u32()?;
+            let n = r.u32()? as usize;
+            if n > MAX_SEQ_GAP as usize {
+                return Err("turn window out of range");
+            }
+            // `usable` indexes into the window; anything past it is corrupt.
+            if usable as usize > n {
+                return Err("usable index out of range");
+            }
+            let mut turns = VecDeque::with_capacity(n);
+            for _ in 0..n {
+                let has = r.flag()?;
+                let bytes = if has { Some(r.bytes()?.to_vec()) } else { None };
+                let lateness = r.u32()?;
+                turns.push_back(HeldTurn {
+                    bytes,
+                    usable_at: None,
+                    lateness,
+                });
+            }
+            slot.first = first;
+            slot.turns = turns;
+            slot.usable = usable as usize;
+        }
+        for window in self.lateness.iter_mut() {
+            window.clear();
+            let n = r.u32()? as usize;
+            if n > LATENESS_WINDOW {
+                return Err("lateness window out of range");
+            }
+            for _ in 0..n {
+                window.push_back(r.u32()?);
+            }
+        }
+        self.leaves.clear();
+        let nl = r.u32()? as usize;
+        if nl > SLOTS {
+            return Err("leave count out of range");
+        }
+        for _ in 0..nl {
+            self.leaves.push(ScheduledLeave {
+                storm: r.u32()? as usize,
+                reason: r.u32()?,
+                step: r.u32()?,
+                applied: r.flag()?,
+            });
+        }
+        r.finish()
+    }
 }
 
 #[cfg(test)]

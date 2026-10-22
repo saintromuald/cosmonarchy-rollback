@@ -58,6 +58,18 @@ pub struct Engine {
     /// The live client (see `rollback/live.rs`), present only when `CM_ROLLBACK_LIVE` is
     /// set. When present, `on_step` delegates entirely to it.
     live: Option<live::Live>,
+    /// Save/load round-trip gate (M1): `CM_ROLLBACK_SAVE_GATE=<depth>` re-simulates
+    /// like the shadow gate, but the restored snapshot first travels through the save
+    /// file format (serialize → file → read → deserialize).
+    save_gate: Option<u32>,
+    /// First frame the save gate runs at (`CM_ROLLBACK_SAVE_GATE_START`, default 90).
+    save_gate_start: u32,
+    /// One-shot save at this frame (`CM_ROLLBACK_SAVE_AT=<frame>`), harness/testing use.
+    save_at: Option<u32>,
+    /// Re-read and compare every save written (`CM_ROLLBACK_SAVE_VERIFY=1`).
+    save_verify: bool,
+    /// Directory saves are written to (`CM_ROLLBACK_SAVE_DIR`, default `cosmo_saves`).
+    save_dir: String,
 }
 
 static ENGINE: Lazy<Mutex<Engine>> = Lazy::new(|| Mutex::new(Engine::new()));
@@ -97,6 +109,26 @@ impl Engine {
             last_exit: None,
             drive: drive::Drive::new(),
             live: live::enabled().then(live::Live::new),
+            save_gate: std::env::var("CM_ROLLBACK_SAVE_GATE")
+                .ok()
+                .and_then(|s| {
+                    if s.is_empty() {
+                        Some(3)
+                    } else {
+                        s.parse().ok()
+                    }
+                })
+                .filter(|&n| n > 0),
+            save_gate_start: std::env::var("CM_ROLLBACK_SAVE_GATE_START")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(90),
+            save_at: std::env::var("CM_ROLLBACK_SAVE_AT")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            save_verify: std::env::var("CM_ROLLBACK_SAVE_VERIFY").is_ok(),
+            save_dir: std::env::var("CM_ROLLBACK_SAVE_DIR")
+                .unwrap_or_else(|_| "cosmo_saves".to_string()),
         }
     }
 
@@ -533,6 +565,24 @@ impl Engine {
             }
         }
 
+        // Save/load round-trip gate (`CM_ROLLBACK_SAVE_GATE=<depth>`): like the shadow
+        // gate, but the snapshot that gets restored first travels through the save file
+        // format (serialize → file → read → deserialize). A lossy format or a
+        // cross-build range-table mismatch shows up as a divergence, exactly like a
+        // lossy snapshot would (M1; see `docs/analysis/save-format.md`).
+        if let Some(depth) = self.save_gate {
+            if f >= depth && f >= self.save_gate_start {
+                self.save_gate_step(f, depth, ecx, orig);
+            }
+        }
+
+        // One-shot save (`CM_ROLLBACK_SAVE_AT=<frame>`): write the state at this
+        // frame's entry to `<save_dir>/save_<frame>.cosmo` (harness/testing use).
+        if self.save_at == Some(f) {
+            self.save_at = None;
+            self.write_save_now(f);
+        }
+
         let rng_ptr = 0x0051_CA14 as *const u32;
         let cnt_ptr = 0x0051_CA18 as *const u32;
         let rng_in = unsafe { *rng_ptr };
@@ -585,6 +635,148 @@ impl Engine {
         // `CM_ROLLBACK_PROBE_OUTER=<frame>`: find which between-frame call mutates state.
         probe_outer_calls(self);
         r
+    }
+
+    /// The save-gate step: restore the ring snapshot at or before `f - depth` **through
+    /// the save file format**, re-simulate to `f`, and compare the state hash against the
+    /// live pass. Mirrors the shadow gate's re-sim (`CM_ROLLBACK_RESIM_LOOP` /
+    /// `CM_ROLLBACK_RESIM_POST` / `CM_ROLLBACK_NO_RESIM_RECV` apply the same way).
+    fn save_gate_step(
+        &mut self,
+        f: u32,
+        depth: u32,
+        ecx: u32,
+        orig: unsafe extern "C" fn(u32) -> u32,
+    ) {
+        let target = f - depth;
+        let Some(pos) = self.ring.iter().rposition(|e| e.frame <= target) else {
+            log(&format!(
+                "[cosmo-rollback] SAVEGATE f{f}: no ring snapshot at or before frame {target}"
+            ));
+            return;
+        };
+        let g = self.ring[pos].frame;
+        let steps = f - g;
+        let before = unsafe { Snapshot::capture(&self.ranges) };
+        let snap_bytes = self.ring[pos].snap.serialize();
+        let path = std::path::PathBuf::from(format!("{}/save_gate.cosmo", self.save_dir));
+        if let Err(e) = crate::savefile::write_save(
+            &path,
+            g,
+            crate::savefile::FLAG_HARNESS,
+            &snap_bytes,
+            &[],
+        ) {
+            log(&format!("[cosmo-rollback] SAVEGATE f{f}: write failed: {e}"));
+            return;
+        }
+        let (loaded, kind) = match crate::savefile::read_save(&path) {
+            Ok((frame, _, sb, _)) if frame == g => (Snapshot::deserialize(&sb), "deserialize"),
+            Ok((frame, _, _, _)) => {
+                log(&format!(
+                    "[cosmo-rollback] SAVEGATE f{f}: file frame {frame} != {g} (stale file?)"
+                ));
+                return;
+            }
+            Err(e) => {
+                log(&format!("[cosmo-rollback] SAVEGATE f{f}: read failed: {e}"));
+                return;
+            }
+        };
+        let snap = match loaded {
+            Ok(snap) => snap,
+            Err(e) => {
+                log(&format!("[cosmo-rollback] SAVEGATE f{f}: {kind} failed: {e}"));
+                return;
+            }
+        };
+        unsafe { snap.restore() };
+        for _ in 0..steps {
+            unsafe { orig(ecx) };
+            // The between-frame work a re-sim must also run (same rules as the shadow
+            // gate; see `docs/analysis/restore-residual.md`).
+            if resim_loop() {
+                unsafe { crate::frame_hook::outer_loop_work() };
+            } else if resim_post() {
+                unsafe { crate::frame_hook::post_frame() };
+            } else if !no_resim_recv() {
+                unsafe { crate::frame_hook::receive_network_messages() };
+            }
+        }
+        let after = unsafe { Snapshot::capture(&self.ranges) };
+        let ignore: Vec<String> = std::env::var("CM_ROLLBACK_GATE_IGNORE")
+            .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
+            .unwrap_or_default();
+        let ignore: Vec<&str> = ignore.iter().map(|s| s.as_str()).collect();
+        if state_hash_ignoring(&before, &ignore) != state_hash_ignoring(&after, &ignore) {
+            log(&format!(
+                "[cosmo-rollback] SAVEGATE DIVERGENCE frame {f} re-sim from {g} through file round-trip ({steps} steps)"
+            ));
+            diff_ranges(&self.ranges, &before, &after);
+        } else if f < 100 || f % 120 == 0 {
+            log(&format!(
+                "[cosmo-rollback] SAVEGATE ok frame {f} (re-sim {steps} steps from {g} through file round-trip)"
+            ));
+        }
+        // Leave the live simulation exactly where it was.
+        unsafe { before.restore() };
+    }
+
+    /// Write the current state as `<save_dir>/save_<frame>.cosmo`, and (with
+    /// `CM_ROLLBACK_SAVE_VERIFY`) read it back and compare. The state saved is this
+    /// frame's **entry** state, i.e. `frame` frames completed.
+    fn write_save_now(&mut self, f: u32) {
+        let snap = unsafe { Snapshot::capture(&self.ranges) };
+        let snap_bytes = snap.serialize();
+        let session = self
+            .session
+            .as_ref()
+            .map(|s| s.save_state())
+            .unwrap_or_default();
+        let path = std::path::PathBuf::from(format!("{}/save_{}.cosmo", self.save_dir, f));
+        match crate::savefile::write_save(
+            &path,
+            f,
+            crate::savefile::FLAG_HARNESS,
+            &snap_bytes,
+            &session,
+        ) {
+            Ok(n) => {
+                log(&format!(
+                    "[cosmo-rollback] save: wrote {} ({} bytes; snapshot {}, session {})",
+                    path.display(),
+                    n,
+                    snap_bytes.len(),
+                    session.len()
+                ));
+                if self.save_verify {
+                    self.verify_save(&path, f, &snap);
+                }
+            }
+            Err(e) => log(&format!("[cosmo-rollback] save: write failed: {e}")),
+        }
+    }
+
+    /// Read a save back and compare its snapshot hash against the in-memory snapshot it
+    /// was written from. Proves the file round-trip is lossless on the real game.
+    fn verify_save(&self, path: &std::path::Path, frame: u32, want: &Snapshot) {
+        let verdict = match crate::savefile::read_save(path) {
+            Ok((f, _, sb, _)) if f == frame => match Snapshot::deserialize(&sb) {
+                Ok(got) => {
+                    if state_hash(&got) == state_hash(want) {
+                        "ok".to_string()
+                    } else {
+                        "MISMATCH (hash)".to_string()
+                    }
+                }
+                Err(e) => format!("MISMATCH (deserialize: {e})"),
+            },
+            Ok((f, _, _, _)) => format!("MISMATCH (frame {f})"),
+            Err(e) => format!("MISMATCH (read: {e})"),
+        };
+        log(&format!(
+            "[cosmo-rollback] saveverify f{frame}: {verdict}"
+        ));
     }
 }
 

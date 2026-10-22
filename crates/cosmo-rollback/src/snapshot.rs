@@ -116,4 +116,86 @@ impl Snapshot {
     pub fn len(&self) -> usize {
         self.data.len()
     }
+
+    /// Serialize the snapshot for a mid-match save (see `savefile`).
+    ///
+    /// The range *table itself* is not serialized — only each range's name and length,
+    /// in order, so the loader can verify the save was made by a build with the same
+    /// range set. A save from a different build (or a corrupted payload) fails at
+    /// [`deserialize`](Self::deserialize) instead of restoring garbage into game memory.
+    pub fn serialize(&self) -> Vec<u8> {
+        use crate::savefile::Writer;
+        let mut w = Writer::new();
+        w.u32(self.ranges.ranges.len() as u32);
+        for r in &self.ranges.ranges {
+            w.bytes(r.name.as_bytes());
+            w.u32(r.len as u32);
+        }
+        w.bytes(&self.data);
+        w.u32(self.blobs.len() as u32);
+        for b in &self.blobs {
+            w.bytes(b);
+        }
+        w.bytes(&self.region);
+        w.bytes(&self.image);
+        w.bytes(&self.tiles);
+        w.bytes(&self.creep);
+        w.bytes(&self.replay);
+        w.bytes(&self.scratch);
+        w.into_bytes()
+    }
+
+    /// Deserialize a snapshot, verifying that the saved range description matches this
+    /// build's range table exactly (names and lengths, in order) and that the payload
+    /// parses completely.
+    ///
+    /// # Errors
+    /// `"truncated"`/`"bad flag"` (corrupt payload), `"range count mismatch"` or
+    /// `"range table mismatch"` (save from a different build), `"trailing bytes"`.
+    pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, &'static str> {
+        use crate::savefile::Reader;
+        let rl = crate::ranges::engine_ranges();
+        let mut r = Reader::new(bytes);
+        let n = r.u32()? as usize;
+        if n != rl.ranges.len() {
+            return Err("range count mismatch (different build?)");
+        }
+        for spec in &rl.ranges {
+            let name = r.bytes()?;
+            let len = r.u32()? as usize;
+            if name != spec.name.as_bytes() || len != spec.len {
+                return Err("range table mismatch (different build?)");
+            }
+        }
+        let data = r.bytes()?.to_vec();
+        if data.len() != rl.total_bytes() {
+            return Err("snapshot data length mismatch");
+        }
+        let nb = r.u32()? as usize;
+        if nb > 64 {
+            return Err("blob count out of range");
+        }
+        let mut blobs = Vec::with_capacity(nb);
+        for _ in 0..nb {
+            blobs.push(r.bytes()?.to_vec());
+        }
+        let region = r.bytes()?.to_vec();
+        let image = r.bytes()?.to_vec();
+        let tiles = r.bytes()?.to_vec();
+        let creep = r.bytes()?.to_vec();
+        let replay = r.bytes()?.to_vec();
+        let scratch = r.bytes()?.to_vec();
+        r.finish()?;
+        Ok(Snapshot {
+            ranges: rl,
+            data,
+            blobs,
+            region,
+            image,
+            tiles,
+            creep,
+            replay,
+            scratch,
+        })
+    }
 }
