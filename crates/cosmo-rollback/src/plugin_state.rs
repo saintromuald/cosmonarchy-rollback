@@ -67,6 +67,12 @@ fn plugins() -> &'static [(&'static str, Fns)] {
         if let Some(f) = resolve_module(b"aise.qdp\0", "cosmo_aise_") {
             v.push(("aise", f));
         }
+        // Cosmonarchy Plus (gameplay fork) may export its own state blob
+        // (`cosmo_plus_state_*`). Resolved by name only — no Plus knowledge here —
+        // and absent when the Plus plugin isn't loaded.
+        if let Some(f) = resolve_module(b"zz-cosmo-plus.qdp\0", "cosmo_plus_") {
+            v.push(("cosmo_plus", f));
+        }
         v
     })
 }
