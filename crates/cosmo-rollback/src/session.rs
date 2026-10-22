@@ -426,6 +426,136 @@ impl Session {
     pub fn take_peer_hash_reports(&mut self) -> Vec<(usize, u32, u64)> {
         std::mem::take(&mut self.peer_reports)
     }
+
+    /// Serialize the session for a mid-match save (see `savefile`).
+    ///
+    /// Saves everything a resumed match needs to continue from the saved frame: the
+    /// input table (turn windows, frontier, mispredictions, leaves), the sim position
+    /// (`current`/`confirmed`), the desync comparison state (peer hashes, own hashes,
+    /// pending reports), the in-flight un-acked local turns and the authority's latest
+    /// lead/turn counts.
+    pub fn save_state(&self) -> Vec<u8> {
+        use crate::savefile::Writer;
+        let mut w = Writer::new();
+        for &req in &self.required {
+            w.flag(req);
+        }
+        w.u32(self.local_slot as u32);
+        w.u32(self.spacing);
+        w.u32(self.current);
+        w.u32(self.confirmed);
+        for &p in &self.peer_hash {
+            w.flag(p.is_some());
+            if let Some((f, h)) = p {
+                w.u32(f);
+                w.u64(h);
+            }
+        }
+        w.opt_u32(self.desync_at);
+        w.flag(self.resimulating);
+        w.opt_u32(self.pending_rollback);
+        w.flag(self.authority_lead.is_some());
+        if let Some((m, p, c)) = self.authority_lead {
+            w.u32(m);
+            w.u32(p);
+            w.u32(c);
+        }
+        w.flag(self.authority_turns.is_some());
+        if let Some(counts) = self.authority_turns {
+            for c in counts {
+                w.u32(c);
+            }
+        }
+        w.u32(self.own_hashes.len() as u32);
+        for (f, h) in &self.own_hashes {
+            w.u32(*f);
+            w.u64(*h);
+        }
+        w.u32(self.peer_reports.len() as u32);
+        for (slot, frame, hash) in &self.peer_reports {
+            w.u32(*slot as u32);
+            w.u32(*frame);
+            w.u64(*hash);
+        }
+        w.u32(self.sent.len() as u32);
+        for (seq, bytes) in &self.sent {
+            w.u32(*seq);
+            w.bytes(bytes);
+        }
+        w.opt_u32(self.peer_acked);
+        w.bytes(&self.table.save_state());
+        w.into_bytes()
+    }
+
+    /// Restore the session from [`save_state`](Self::save_state) bytes. The loader is
+    /// bounds-checked end to end; a corrupt save fails with an `Err` instead of
+    /// silently changing the session.
+    pub fn load_state(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
+        use crate::savefile::Reader;
+        let mut r = Reader::new(bytes);
+        for req in self.required.iter_mut() {
+            *req = r.flag()?;
+        }
+        self.local_slot = r.u32()? as usize;
+        self.spacing = r.u32()?.max(1);
+        self.current = r.u32()?;
+        self.confirmed = r.u32()?;
+        for p in self.peer_hash.iter_mut() {
+            *p = if r.flag()? {
+                Some((r.u32()?, r.u64()?))
+            } else {
+                None
+            };
+        }
+        self.desync_at = r.opt_u32()?;
+        self.resimulating = r.flag()?;
+        self.pending_rollback = r.opt_u32()?;
+        self.authority_lead = if r.flag()? {
+            Some((r.u32()?, r.u32()?, r.u32()?))
+        } else {
+            None
+        };
+        self.authority_turns = if r.flag()? {
+            let mut counts = [0u32; crate::transport::SLOTS];
+            for c in counts.iter_mut() {
+                *c = r.u32()?;
+            }
+            Some(counts)
+        } else {
+            None
+        };
+        self.own_hashes.clear();
+        let nh = r.u32()? as usize;
+        if nh > OWN_HASH_WINDOW {
+            return Err("own hash window out of range");
+        }
+        for _ in 0..nh {
+            self.own_hashes.push_back((r.u32()?, r.u64()?));
+        }
+        self.peer_reports.clear();
+        let nr = r.u32()? as usize;
+        if nr > 256 {
+            return Err("peer report count out of range");
+        }
+        for _ in 0..nr {
+            self.peer_reports
+                .push((r.u32()? as usize, r.u32()?, r.u64()?));
+        }
+        self.sent.clear();
+        let ns = r.u32()? as usize;
+        if ns > SENT_WINDOW {
+            return Err("sent window out of range");
+        }
+        for _ in 0..ns {
+            let seq = r.u32()?;
+            let bytes = r.bytes()?.to_vec();
+            self.sent.push_back((seq, bytes));
+        }
+        self.peer_acked = r.opt_u32()?;
+        let table = r.bytes()?;
+        self.table.load_state(table)?;
+        r.finish()
+    }
 }
 
 /// What the authority decided about one step's desync hashes (ADR-0001 §1.1).
@@ -1178,5 +1308,65 @@ mod tests {
             "an acknowledged turn must not be re-sent: {:?}",
             ab.out
         );
+    }
+
+    // ---- save/load round trip (M1) -------------------------------------------------
+
+    #[test]
+    fn session_state_round_trips_through_save() {
+        use crate::transport::Loopback;
+        let now = Instant::now();
+        let mut s = Session::new(0, &[1], 8, 2, 3, [Duration::ZERO; SLOTS]);
+        // Exercise every saveable facet: turns in the table (with a gap in slot 1's
+        // window), a settled frame, our own hash, an agreeing peer hash, an un-acked
+        // sent turn, and a scheduled leave.
+        s.push_local_seq(0, vec![0xa0], now);
+        s.push_remote_seq(1, 0, vec![0xb0], now);
+        s.push_local_seq(1, vec![0xa1], now);
+        // seq 2 for slot 1 has not arrived yet: a gap in the window.
+        s.push_local_seq(2, vec![0xa2], now);
+        let mut link = Loopback::new(0);
+        s.send_local_turn(&mut link, 2, vec![0xa2], now);
+        s.dispatch(0);
+        s.settle(1, 0xaa);
+        s.report_hash(1, 0xaa);
+        s.peer_hash(1, 1, 0xaa); // agrees
+        s.slot_left(1, 1, 3);
+
+        let bytes = s.save_state();
+        let mut t = Session::new(0, &[1], 8, 2, 3, [Duration::ZERO; SLOTS]);
+        t.load_state(&bytes).expect("session load");
+
+        assert_eq!(t.local_slot(), 0);
+        assert_eq!(t.spacing(), 3);
+        assert_eq!(t.current(), s.current());
+        assert_eq!(t.confirmed(), s.confirmed());
+        assert_eq!(t.desync_at(), None, "an agreeing peer hash is not a desync");
+        assert_eq!(t.hash_of(1), Some(0xaa));
+        // The restored session dispatches the same turns the original does.
+        for step in [0u32, 1, 2] {
+            let (a, pa) = s.dispatch(step);
+            let (b, pb) = t.dispatch(step);
+            assert_eq!(a, b, "step {step} dispatches differently after load");
+            assert_eq!(pa, pb, "step {step} prediction counts differ after load");
+        }
+        // Both were mutated identically, so re-saving both must give identical bytes —
+        // this covers the leaves, the sent queue, the hashes and the table in one check.
+        assert_eq!(
+            s.save_state(),
+            t.save_state(),
+            "re-saved state differs after an identical load+dispatch"
+        );
+    }
+
+    #[test]
+    fn session_load_rejects_a_corrupt_save() {
+        let now = Instant::now();
+        let mut s = Session::new(0, &[1], 8, 0, 3, [Duration::ZERO; SLOTS]);
+        s.push_local(vec![1], now);
+        let mut bytes = s.save_state();
+        bytes.truncate(bytes.len() - 1);
+        let mut t = Session::new(0, &[1], 8, 0, 3, [Duration::ZERO; SLOTS]);
+        assert!(t.load_state(&bytes).is_err());
     }
 }

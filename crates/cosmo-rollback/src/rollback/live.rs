@@ -39,7 +39,7 @@ use crate::log::log;
 use crate::ranges::{self, RangeList};
 use crate::session::{Authority, Session, Verdict};
 use crate::snapshot::Snapshot;
-use crate::state_hash::desync_hash;
+use crate::state_hash::{desync_hash, state_hash};
 use crate::transport::{CrownLink, Link, Msg};
 use crate::turns::SLOTS;
 
@@ -182,6 +182,16 @@ pub struct Live {
     hash_every: u32,
     /// The frame whose desync fingerprint has been logged, so it is logged once.
     desync_logged: Option<u32>,
+    /// Autosave cadence (M1): write a full save every this many **confirmed** frames
+    /// (`CM_ROLLBACK_AUTOSAVE_EVERY`, default 1440 ≈ 1 minute at Fastest). Only when
+    /// the client is driving a real match.
+    autosave_every: Option<u32>,
+    /// How many autosave files to keep (`CM_ROLLBACK_AUTOSAVE_KEEP`, default 4).
+    autosave_keep: usize,
+    /// Re-read and compare every save written (`CM_ROLLBACK_SAVE_VERIFY=1`).
+    save_verify: bool,
+    /// Directory saves are written to (`CM_ROLLBACK_SAVE_DIR`, default `cosmo_saves`).
+    save_dir: String,
 }
 
 /// `g_is_in_game` (`BW/bwdata.h`): 0 in the menus, 1 once the match is running.
@@ -333,6 +343,18 @@ impl Live {
                 .filter(|&n| n > 0)
                 .unwrap_or(8),
             desync_logged: None,
+            autosave_every: std::env::var("CM_ROLLBACK_AUTOSAVE_EVERY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&n| n > 0),
+            autosave_keep: std::env::var("CM_ROLLBACK_AUTOSAVE_KEEP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(4),
+            save_verify: std::env::var("CM_ROLLBACK_SAVE_VERIFY").is_ok(),
+            save_dir: std::env::var("CM_ROLLBACK_SAVE_DIR")
+                .unwrap_or_else(|_| "cosmo_saves".to_string()),
         }
     }
 
@@ -343,6 +365,56 @@ impl Live {
     /// Our own recorded desync hash for `frame`, if we produced it.
     fn hash_of(&self, frame: u32) -> Option<u64> {
         self.session.hash_of(frame)
+    }
+
+    /// Write the autosave for `frame` (the just-settled, confirmed state) and prune.
+    fn autosave(&mut self, frame: u32) {
+        let snap = unsafe { Snapshot::capture(self.ranges) };
+        let snap_bytes = snap.serialize();
+        let session = self.session.save_state();
+        let path = std::path::PathBuf::from(format!("{}/autosave_{}.cosmo", self.save_dir, frame));
+        match crate::savefile::write_save(
+            &path,
+            frame,
+            crate::savefile::FLAG_LIVE,
+            &snap_bytes,
+            &session,
+        ) {
+            Ok(n) => {
+                log(&format!(
+                    "[cosmo-rollback] autosave f{frame}: wrote {} ({} bytes; snapshot {}, session {})",
+                    path.display(),
+                    n,
+                    snap_bytes.len(),
+                    session.len()
+                ));
+                if self.save_verify {
+                    self.verify_autosave(&path, frame, &snap);
+                }
+                crate::savefile::prune_autosaves(&self.save_dir, self.autosave_keep);
+            }
+            Err(e) => log(&format!("[cosmo-rollback] autosave f{frame}: write failed: {e}")),
+        }
+    }
+
+    /// Read an autosave back and compare its snapshot hash against the in-memory
+    /// snapshot it was written from, proving the file round-trip is lossless.
+    fn verify_autosave(&self, path: &std::path::Path, frame: u32, want: &Snapshot) {
+        let verdict = match crate::savefile::read_save(path) {
+            Ok((f, _, sb, _)) if f == frame => match Snapshot::deserialize(&sb) {
+                Ok(got) => {
+                    if state_hash(&got) == state_hash(want) {
+                        "ok".to_string()
+                    } else {
+                        "MISMATCH (hash)".to_string()
+                    }
+                }
+                Err(e) => format!("MISMATCH (deserialize: {e})"),
+            },
+            Ok((f, _, _, _)) => format!("MISMATCH (frame {f})"),
+            Err(e) => format!("MISMATCH (read: {e})"),
+        };
+        log(&format!("[cosmo-rollback] saveverify f{frame}: {verdict}"));
     }
 
     /// One game frame. `orig` is the engine's frame function through the trampoline; it is
@@ -673,6 +745,19 @@ impl Live {
                             self.agreements
                         ));
                     }
+                }
+            }
+        }
+
+        // 6b. Autosave (M1): every `autosave_every` **confirmed** frames, write the full
+        //     snapshot + session to `<save_dir>/autosave_<frame>.cosmo` and prune to the
+        //     newest `autosave_keep`. A save is only taken when the frame just produced is
+        //     confirmed — predicted state may still be corrected by a rollback and is not
+        //     a safe resume point (see `docs/analysis/save-format.md`).
+        if let Some(every) = self.autosave_every {
+            if self.started && present > 0 && present % every == 0 {
+                if present == self.session.confirmed() {
+                    self.autosave(present);
                 }
             }
         }
