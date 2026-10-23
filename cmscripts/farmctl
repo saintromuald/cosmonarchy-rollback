@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# farmctl — control the cosmo-farm on this machine.
+#
+#   farmctl run-once       one round per slot, foreground, everything to stdout
+#   farmctl start          arm the systemd timer (overnight schedule)
+#   farmctl stop           stop farmd + write the stop file
+#   farmctl status         peer/farm summary
+#   farmctl report         latest triage clustering
+#   farmctl install        install + enable the systemd timer
+#   farmctl tail [slot]    tail the farm log for a slot
+set -u
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONF="$ROOT/cmscripts/farm.conf"
+[ -f "$CONF" ] && . "$CONF"
+FARMDIR="${FARMDIR:-$HOME/Games/cosmo-farm}"
+CMD="${1:-status}"
+
+case "$CMD" in
+    run-once)
+        exec "$ROOT/cmscripts/farmd.sh" --once
+        ;;
+    start)
+        rm -f "$FARMDIR/stop"
+        systemctl --user enable --now cosmo-farm.timer 2>/dev/null \
+            || echo "timer not installed — run: farmctl install"
+        ;;
+    stop)
+        touch "$FARMDIR/stop"
+        systemctl --user disable --now cosmo-farm.timer 2>/dev/null || true
+        echo "stopped (timer disabled; stop file written — farmd finishes its current run)"
+        ;;
+    install)
+        exec "$ROOT/cmscripts/install-systemd.sh"
+        ;;
+    status)
+        echo "== machine: $(hostname)  ($(nproc) threads, $(( $(awk '/MemTotal/ {print int($2/1024/1024)}' /proc/meminfo) )) GB RAM)"
+        [ -f "$FARMDIR/farm.local.conf" ] && grep FARM_SLOTS "$FARMDIR/farm.local.conf"
+        if [ -f "$FARMDIR/farmd.pid" ] && kill -0 "$(cat "$FARMDIR/farmd.pid")" 2>/dev/null; then
+            echo "farmd: running (pid $(cat "$FARMDIR/farmd.pid"))"
+        else
+            echo "farmd: not running"
+        fi
+        [ -f "$FARMDIR/stop" ] && echo "stop file: present"
+        systemctl --user is-active cosmo-farm.timer 2>/dev/null || true
+        ;;
+    report)
+        exec python3 "$ROOT/cmscripts/triage.py" "$@" 2>/dev/null || exec python3 "$ROOT/cmscripts/triage.py"
+        ;;
+    tail)
+        SLOT="${2:-0}"
+        exec tail -f "$FARMDIR/runs/slot$SLOT/worker.log"
+        ;;
+    *)
+        echo "usage: farmctl run-once|start|stop|status|report|install|tail [slot]" >&2
+        exit 2
+        ;;
+esac

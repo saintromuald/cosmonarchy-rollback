@@ -43,6 +43,18 @@ whack_funcs!(init_outer_cdecl, 0x00400000,
 
 static PATCHER: std::sync::Mutex<whack::Patcher> = std::sync::Mutex::new(whack::Patcher::new());
 
+/// Run `f` over the exe's module patcher (the one `install` used). Used by
+/// `farm.rs` for its one-shot game-start patches (unpaced stepping + render
+/// skip once the match has started).
+pub fn patch_exe(f: impl FnOnce(&mut whack::ModulePatcher)) {
+    let mut patcher = match PATCHER.lock() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let mut exe = patcher.patch_exe(0x00400000);
+    f(&mut exe);
+}
+
 pub fn install() {
     let mut patcher = match PATCHER.lock() {
         Ok(p) => p,
@@ -51,6 +63,8 @@ pub fn install() {
     let mut exe = patcher.patch_exe(0x00400000);
     // Turn capture + injection primitives (see `turn_hook.rs`).
     crate::turn_hook::install(&mut exe);
+    // Farm driver patches: unpaced stepping + render skip (see `farm.rs`).
+    crate::farm::install(&mut exe);
     // The live client (CM_ROLLBACK_LIVE) additionally suppresses the engine's own turn path.
     crate::rollback::live::install(&mut exe);
     // In-context trace of the outer loop's between-frame calls (`CM_ROLLBACK_TRACE_OUTER`).
