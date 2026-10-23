@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Boot the game headlessly and print a process/log timeline, for boot diagnostics.
-# Usage: probe-boot.sh [build] [total_secs] [display]
+# Usage: probe-boot.sh [build] [total_secs] [display] [clicks]
+# Clicks use headless_probe syntax: "x,y;x,y,2;key:Return" (double-click, keys).
 set -u
 
 BUILD="${1:-Release}"
 TOTAL="${2:-240}"
 DISPLAY_NUM="${3:-:97}"
+CLICKS="${4:-}"
 GAME_ROOT="${COSMO_GAME_ROOT:-$HOME/Games/cosmonarchy}"
 LOG_DIR="${COSMO_LOG_DIR:-/tmp/opencode}"
 BASE="$GAME_ROOT/prefix/drive_c/Cosmonarchy"
@@ -32,6 +34,32 @@ GPID=$!
 
 p0=$(wc -c < "$PLOG" 2>/dev/null || echo 0)
 r0=$(wc -c < "$RLOG" 2>/dev/null || echo 0)
+# Optional click sequence, sent right after the first sample window closes (t=60s,
+# when the menu should be up): same syntax as headless_probe (x,y / x,y,2 / key:Name).
+if [ -n "$CLICKS" ]; then
+    (
+        sleep 80
+        IFS=';' read -ra CS <<< "$CLICKS"
+        for c in "${CS[@]}"; do
+            if [[ "$c" == key:* ]]; then
+                DISPLAY="$DISPLAY_NUM" xdotool key "${c#key:}"
+                sleep 2
+                continue
+            fi
+            x="${c%%,*}"
+            rest="${c#*,}"
+            y="${rest%%,*}"
+            n="${rest#"$y"}"
+            n="${n#,}"
+            if [ "$n" = "2" ]; then
+                DISPLAY="$DISPLAY_NUM" xdotool mousemove "$x" "$y" click --repeat 2 --delay 60 1
+            else
+                DISPLAY="$DISPLAY_NUM" xdotool mousemove "$x" "$y" click 1
+            fi
+            sleep 5
+        done
+    ) &
+fi
 for i in $(seq 1 $((TOTAL / 15))); do
     sleep 15
     t=$((i * 15))
