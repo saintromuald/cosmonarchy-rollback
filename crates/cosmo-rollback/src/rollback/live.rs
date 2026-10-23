@@ -157,6 +157,11 @@ pub struct Live {
     ai_present: bool,
     /// When the client took over (used to detect a peer that never speaks the channel).
     started_at: Option<Instant>,
+    /// How long after takeover a client waits for the peer's first rollback turn
+    /// before falling back to normal lockstep (`CM_ROLLBACK_PEER_GRACE`, seconds).
+    /// The farm starts both clients from separate menu navigations that finish at
+    /// slightly different times, so it sets a generous value.
+    peer_grace: Duration,
     /// Whether a peer turn has ever arrived.
     peer_seen: bool,
     /// Set when the peer never spoke the channel: the other player is not running the plugin,
@@ -210,7 +215,6 @@ impl Live {
         let limit = std::env::var("CM_ROLLBACK_PREDICT")
             .ok()
             .and_then(|s| s.parse().ok())
-            .filter(|&n| n > 0)
             .unwrap_or(8);
         // v1 is 1v1: slot 0 is the session creator (the host, ADR-0001 §1) and slot 1 the
         // guest. The local slot is the host's.
@@ -287,6 +291,12 @@ impl Live {
             .unwrap_or(0);
         let scripted = std::env::var("CM_ROLLBACK_SCRIPT_REMOTE").is_ok()
             || std::env::var("CM_ROLLBACK_SCRIPT_PEER").is_ok();
+        let peer_grace = std::env::var("CM_ROLLBACK_PEER_GRACE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(3));
         if link.is_none() {
             log(
                 "[cosmo-rollback] live: no transport (replay harness or stock .snp); running \
@@ -312,6 +322,7 @@ impl Live {
             inject,
             ai_present: false,
             started_at: None,
+            peer_grace,
             peer_seen: false,
             no_peer: false,
             skip_start: std::env::var("CM_ROLLBACK_SKIP_START_TURNS")
@@ -382,6 +393,10 @@ impl Live {
                 self.ai_present = true;
             }
             self.started_at = Some(Instant::now());
+            // Farm: once the match has started, free-run the simulation and stop
+            // presenting frames (the menus stay paced + rendered for the OCR
+            // navigation). See `farm.rs`.
+            crate::farm::unpace_and_hide_render();
             // Identify the state we take over from: if two clients disagree here, their
             // divergence is the setup, not the netcode.
             unsafe {
@@ -400,6 +415,10 @@ impl Live {
         let now = Instant::now();
         self.ticks = self.ticks.wrapping_add(1);
         let current = self.session.current();
+
+        // Farm command streams: inject this step's scripted turns for every armed slot
+        // (identical files on both clients -> identical inputs; see `farm.rs`).
+        crate::farm::inject_stream_turns(self.steps, self.limit);
 
         // 1. Absorb the peer's messages. Turns go into the input table by sequence number.
         if let Some(link) = self.link.as_mut() {
@@ -461,7 +480,7 @@ impl Live {
             self.peer_seen = true;
         }
         let waited = self.started_at.map(|t| t.elapsed()).unwrap_or_default();
-        if !self.peer_seen && waited >= std::time::Duration::from_secs(3) {
+        if !self.peer_seen && waited >= self.peer_grace {
             self.peer_seen = true;
             if self.session.confirmed() == 0 {
                 log(
@@ -689,9 +708,24 @@ impl Live {
                         // Stop waiting on the slot from the frame it diverged at.
                         self.session.slot_left(slot, 0, frame);
                     }
-                    Verdict::Void => log(&format!(
-                        "[cosmo-rollback] live: voiding the game (no hash majority at frame {frame})"
-                    )),
+                    Verdict::Void => {
+                        log(&format!(
+                            "[cosmo-rollback] live: voiding the game (no hash majority at frame {frame})"
+                        ));
+                        // Farm triage: log our own per-range fingerprint at the voided
+                        // frame so it can be diffed against the peer's `live desync`
+                        // lines (the guest logs the same block from its side).
+                        let snap = unsafe { Snapshot::capture(self.ranges) };
+                        for (name, bytes) in snap.range_iter() {
+                            if name.ends_with(".render") || !crate::state_hash::is_compared(name) {
+                                continue;
+                            }
+                            log(&format!(
+                                "[cosmo-rollback] live desync f{frame} range {name} {:016x}",
+                                crate::state_hash::hash_bytes(bytes)
+                            ));
+                        }
+                    }
                     Verdict::Agreed => {
                         self.agreements += 1;
                         if self.agreements < 6 || self.agreements % 16 == 0 {

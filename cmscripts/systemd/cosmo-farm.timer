@@ -1,0 +1,10 @@
+[Unit]
+Description=Cosmonarchy desync farm schedule
+
+[Timer]
+OnCalendar=*-*-* 22:30:00
+Persistent=true
+Unit=cosmo-farm.service
+
+[Install]
+WantedBy=timers.target

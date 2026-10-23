@@ -12,6 +12,7 @@ mod audit;
 mod bw161;
 mod crash;
 mod creep;
+mod farm;
 mod frame_hook;
 mod image;
 mod log;
