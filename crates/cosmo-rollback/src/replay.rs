@@ -39,6 +39,9 @@ pub fn capture() -> Vec<u8> {
         if p.is_null() {
             return Vec::new();
         }
+        if !crate::modules::range_committed(p as usize, REPLAY_DATA_SIZE) {
+            return Vec::new();
+        }
         std::slice::from_raw_parts(p, REPLAY_DATA_SIZE).to_vec()
     }
 }
@@ -50,6 +53,9 @@ pub fn restore(blob: &[u8]) {
     unsafe {
         let p = *(REPLAY_DATA_PTR as *const u32) as *mut u8;
         if p.is_null() {
+            return;
+        }
+        if !crate::modules::range_committed(p as usize, REPLAY_DATA_SIZE) {
             return;
         }
         std::ptr::copy_nonoverlapping(blob.as_ptr(), p, REPLAY_DATA_SIZE);

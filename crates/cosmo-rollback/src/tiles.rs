@@ -45,6 +45,15 @@ pub fn capture() -> Vec<u8> {
             ));
             return Vec::new();
         }
+        // The tile array is a heap buffer the engine owns; if the map was unloaded its
+        // backing pages are gone and copying would fault (see `modules::range_committed`).
+        if !crate::modules::range_committed(base as usize, len) {
+            crate::log::log(&format!(
+                "[cosmo-rollback] tiles capture skipped: base=0x{:x} len=0x{:x} not committed",
+                base as usize, len
+            ));
+            return Vec::new();
+        }
         once(&format!(
             "[cosmo-rollback] tiles capture: base=0x{:x} w={} h={} len=0x{:x}",
             base as usize, w, h, len
@@ -66,6 +75,9 @@ pub fn restore(blob: &[u8]) {
         let h = *(MAP_HEIGHT as *const u16) as usize;
         let len = w.saturating_mul(h).saturating_mul(4);
         if len == 0 || len > MAX_BYTES || blob.len() < len {
+            return;
+        }
+        if !crate::modules::range_committed(base as usize, len) {
             return;
         }
         std::ptr::copy_nonoverlapping(blob.as_ptr(), base, len);

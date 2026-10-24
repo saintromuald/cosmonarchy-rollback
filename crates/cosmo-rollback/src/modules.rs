@@ -15,8 +15,51 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Module32First, Module32Next, MODULEENTRY32, TH32CS_SNAPMODULE,
     TH32CS_SNAPMODULE32,
 };
+use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION};
 
 use crate::ranges::RangeSpec;
+
+const MEM_COMMIT: u32 = 0x1000;
+const PAGE_NOACCESS: u32 = 0x01;
+
+/// True when every byte of `[addr, addr+len)` is committed, readable process memory.
+///
+/// Used to validate engine-owned buffers before the snapshot copies them: a heap
+/// allocation the game freed (path pool at game end, tile/creep arrays at map unload)
+/// can leave a stale pointer in a `.data` slot, and a memcpy from it faults the
+/// process. Module images never unmapped and are not routed through here.
+pub fn range_committed(addr: usize, len: usize) -> bool {
+    if addr == 0 || len == 0 {
+        return false;
+    }
+    let Some(end) = addr.checked_add(len) else {
+        return false;
+    };
+    let mut cursor = addr;
+    unsafe {
+        while cursor < end {
+            let mut mbi: MEMORY_BASIC_INFORMATION = zeroed();
+            if VirtualQuery(
+                cursor as *const core::ffi::c_void,
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            ) == 0
+            {
+                return false;
+            }
+            if mbi.State != MEM_COMMIT || mbi.Protect == PAGE_NOACCESS {
+                return false;
+            }
+            let base = mbi.BaseAddress as usize;
+            let next = base.saturating_add(mbi.RegionSize);
+            if next <= cursor {
+                return false;
+            }
+            cursor = next;
+        }
+    }
+    true
+}
 
 const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 const IMAGE_SCN_MEM_SHARED: u32 = 0x1000_0000;

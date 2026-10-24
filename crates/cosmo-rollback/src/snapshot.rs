@@ -6,7 +6,7 @@ use crate::creep;
 use crate::image;
 use crate::plugin_state;
 use crate::pools;
-use crate::ranges::RangeList;
+use crate::ranges::{RangeList, RangeSpec};
 use crate::region;
 use crate::replay;
 use crate::tiles;
@@ -28,6 +28,36 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Resolve a range's live address. Pointer-read ("dynamic") ranges are re-read from
+    /// their `.data` slot and checked against the process memory map: a pool the engine
+    /// freed or moved since plugin load is skipped instead of faulting the copy. Returns
+    /// `(address, valid)`; an invalid range keeps its snapshot slot zeroed and is not
+    /// written back on restore.
+    fn resolve(r: &RangeSpec) -> (usize, bool) {
+        if crate::pools::is_dynamic(r.name) {
+            let fresh = crate::pools::dynamic_base(r.name);
+            let addr = if fresh != 0 { fresh } else { r.addr };
+            (addr, crate::modules::range_committed(addr, r.len))
+        } else {
+            (r.addr, true)
+        }
+    }
+
+    /// Log a skipped range once per range name per process.
+    fn note_skipped(name: &'static str, addr: usize, len: usize) {
+        use once_cell::sync::Lazy;
+        use std::sync::Mutex;
+        static SKIPPED: Lazy<Mutex<Vec<&'static str>>> = Lazy::new(|| Mutex::new(Vec::new()));
+        let mut seen = SKIPPED.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&name) {
+            crate::log::log(&format!(
+                "[cosmo-rollback] snapshot: range {name} @0x{addr:08x} len 0x{len:x} is not \
+                 committed process memory; skipping (zero-filled)"
+            ));
+            seen.push(name);
+        }
+    }
+
     /// Copy every range's bytes out of the game's address space, plus plugin state.
     ///
     /// # Safety
@@ -39,8 +69,13 @@ impl Snapshot {
         let mut data = vec![0u8; total];
         let mut off = 0usize;
         for r in &rl.ranges {
-            let src = std::slice::from_raw_parts(r.addr as *const u8, r.len);
-            data[off..off + r.len].copy_from_slice(src);
+            let (addr, valid) = Self::resolve(r);
+            if valid {
+                let src = std::slice::from_raw_parts(addr as *const u8, r.len);
+                data[off..off + r.len].copy_from_slice(src);
+            } else {
+                Self::note_skipped(r.name, addr, r.len);
+            }
             off += r.len;
         }
         Snapshot {
@@ -65,8 +100,13 @@ impl Snapshot {
     pub unsafe fn restore(&self) {
         let mut off = 0usize;
         for r in &self.ranges.ranges {
-            let dst = std::slice::from_raw_parts_mut(r.addr as *mut u8, r.len);
-            dst.copy_from_slice(&self.data[off..off + r.len]);
+            let (addr, valid) = Self::resolve(r);
+            if valid {
+                let dst = std::slice::from_raw_parts_mut(addr as *mut u8, r.len);
+                dst.copy_from_slice(&self.data[off..off + r.len]);
+            } else {
+                Self::note_skipped(r.name, addr, r.len);
+            }
             off += r.len;
         }
         plugin_state::restore_blobs(&self.blobs);
