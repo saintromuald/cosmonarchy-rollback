@@ -482,6 +482,33 @@ const GUARD_LIST_PLAYERS: usize = 0x0068_5108;
 /// (`BW/structures.h:825-828`), `GuardAi` 0x20 bytes.
 const GUARD_POOL_BYTES: usize = 1000 * 0x20 + 4;
 
+/// Ranges whose base lives in a `.data` pointer slot and whose backing allocation the
+/// engine owns. The game frees or moves these across game/map boundaries (the path pool
+/// at game end, heap-resident pools when a build relocates them), so a base resolved once
+/// at plugin load can be dead or wrong by the next capture — copying from it faults the
+/// process. `snapshot.rs` re-reads the slot and validates the mapping on every
+/// capture/restore for these names.
+const DYNAMIC_RANGES: &[(&str, usize)] = &[
+    ("path_array", PATH_ARRAY_START),
+    ("ai_script_pool", AI_SCRIPT_ARRAY),
+    ("guard_pool", GUARD_LIST_PLAYERS),
+];
+
+/// Whether `name` is one of the pointer-read ranges above.
+pub fn is_dynamic(name: &str) -> bool {
+    DYNAMIC_RANGES.iter().any(|&(n, _)| n == name)
+}
+
+/// Fresh base for a pointer-read range, re-read from its `.data` slot (0 when null).
+pub fn dynamic_base(name: &str) -> usize {
+    for &(n, slot) in DYNAMIC_RANGES {
+        if n == name {
+            return unsafe { std::ptr::read_unaligned(slot as *const u32) as usize };
+        }
+    }
+    0
+}
+
 /// Pool fields the outer main loop writes **between** two logic frames, so a frame
 /// re-simulation cannot reproduce them and they must not be part of the state hash. They are
 /// still snapshotted — a restore puts them back, which keeps rollback correct for the units

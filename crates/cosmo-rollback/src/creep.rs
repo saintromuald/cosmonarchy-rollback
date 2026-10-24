@@ -94,6 +94,14 @@ pub fn capture() -> Vec<u8> {
                 ));
                 return Vec::new();
             }
+            // Heap arrays the engine owns; a freed buffer must not be copied.
+            if !crate::modules::range_committed(base as usize, len) {
+                crate::log::log(&format!(
+                    "[cosmo-rollback] creep capture skipped: slot=0x{:x} base=0x{:x} len=0x{:x} not committed",
+                    slot, base as usize, len
+                ));
+                return Vec::new();
+            }
             out.extend_from_slice(std::slice::from_raw_parts(base, len));
         }
     }
@@ -132,6 +140,10 @@ pub fn restore(blob: &[u8]) {
             let len = w.saturating_mul(h).saturating_mul(elem);
             if base.is_null() || len == 0 {
                 return;
+            }
+            if !crate::modules::range_committed(base as usize, len) {
+                off += len;
+                continue;
             }
             std::ptr::copy_nonoverlapping(blob.as_ptr().add(off), base, len);
             off += len;
