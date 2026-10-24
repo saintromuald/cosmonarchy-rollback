@@ -66,5 +66,6 @@ unsafe fn startup() {
     let _api: *const PluginApi = ctx.api();
 
     crate::frame_hook::install();
+    crate::bug_capture::install();
     crate::audit::on_start();
 }

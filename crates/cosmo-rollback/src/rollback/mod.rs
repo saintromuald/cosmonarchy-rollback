@@ -785,6 +785,7 @@ pub fn on_frame(ecx: u32, orig: unsafe extern "C" fn(u32) -> u32) -> u32 {
     // The range table is built here, on the first frame, not at plugin startup: it resolves
     // pools the game only allocates when it starts.
     crate::audit::log_layout();
+    crate::bug_capture::maybe_capture();
     match ENGINE.lock() {
         Ok(mut e) => e.on_step(ecx, orig),
         Err(_) => unsafe { orig(ecx) },

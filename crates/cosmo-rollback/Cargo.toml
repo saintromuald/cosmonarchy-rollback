@@ -29,4 +29,5 @@ features = [
     "Win32_System_Kernel",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
+    "Win32_UI_Input_KeyboardAndMouse",
 ]
