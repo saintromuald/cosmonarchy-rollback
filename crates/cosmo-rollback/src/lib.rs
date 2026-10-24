@@ -9,6 +9,7 @@
 extern crate whack;
 
 mod audit;
+mod bug_capture;
 mod bw161;
 mod crash;
 mod creep;
