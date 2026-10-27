@@ -22,6 +22,7 @@ mod outer_trace;
 mod plugin;
 mod plugin_state;
 mod pools;
+mod projection;
 mod ranges;
 mod region;
 mod replay;

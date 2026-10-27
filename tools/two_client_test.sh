@@ -8,9 +8,9 @@
 #
 # The menu is driven with the mod's current layout: [profile dialog -> Enter], Single Player,
 # [profile dialog -> Enter], Replay, then the LastReplay row is located by OCR and Ok starts
-# it. The two clients finish their menus at different times, so the peer grace is generous
-# (CM_ROLLBACK_PEER_GRACE, default 90 s) — without it the first client would fall back to
-# lockstep before the second one even loads.
+# it. The two clients finish their menus at different times; the arming pending phase runs
+# the match in pure lockstep until both sides have confirmed, so the late client is absorbed
+# with no divergence (the host's Arm flip waits for it).
 #
 #   tools/two_client_test.sh [Build] [delay_ms] [boot_secs] [post_secs]
 #
@@ -97,7 +97,6 @@ launch() { # root display local_port peer_port slot gameid out
         CM_ROLLBACK_UDP="$local_port:$peer_port:$DELAY" \
         CM_ROLLBACK_NO_PLUGIN=1 \
         CM_ROLLBACK_HASH_EVERY="${HASH_EVERY:-4}" \
-        CM_ROLLBACK_PEER_GRACE="${PEER_GRACE:-90}" \
         env ${ALLOW_AI:+CM_ROLLBACK_ALLOW_AI=1} \
         DISPLAY="$display" WAYLAND_DISPLAY= setsid umu-run "C:\\Cosmonarchy\\$BUILD\\Cosmonarchy BW.exe" \
             >"$out" 2>&1 </dev/null

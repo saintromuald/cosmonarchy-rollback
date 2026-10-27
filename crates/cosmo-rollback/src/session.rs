@@ -58,6 +58,8 @@ pub struct Session {
     authority_lead: Option<(u32, u32, u32)>,
     /// The authority's most recent per-slot turn counts, if any.
     authority_turns: Option<[u32; crate::transport::SLOTS]>,
+    /// The flip frame the host announced in the arming handshake, if any.
+    arm_frame: Option<u32>,
     /// Our own desync hash for each recently settled frame, so a peer's hash can be compared
     /// the moment it *arrives* — it may well arrive after we settled that frame.
     own_hashes: std::collections::VecDeque<(u32, u64)>,
@@ -111,6 +113,7 @@ impl Session {
             pending_rollback: None,
             authority_lead: None,
             authority_turns: None,
+            arm_frame: None,
             own_hashes: std::collections::VecDeque::new(),
             peer_reports: Vec::new(),
             sent: std::collections::VecDeque::new(),
@@ -165,6 +168,12 @@ impl Session {
                         self.peer_acked = Some(self.peer_acked.map_or(seq, |a| a.max(seq)));
                     }
                 }
+                Msg::Arm { frame } => {
+                    // The arming handshake: the host announces the flip frame. A later
+                    // announcement supersedes an earlier one (the host re-sends until the
+                    // flip, with a possibly updated frame).
+                    self.arm_frame = Some(self.arm_frame.map_or(frame, |f| f.max(frame)));
+                }
                 Msg::LeadReport {
                     median_lateness,
                     p90_lateness,
@@ -183,6 +192,18 @@ impl Session {
     /// The authority's most recent per-slot turn counts.
     pub fn authority_turns(&self) -> Option<[u32; crate::transport::SLOTS]> {
         self.authority_turns
+    }
+
+    /// The flip frame the host announced in the arming handshake, if any.
+    pub fn arm_frame(&self) -> Option<u32> {
+        self.arm_frame
+    }
+
+    /// Whether any turn has been received from `slot` (the arming handshake's "the peer
+    /// is running the plugin" signal — keyed on traffic, not on the contiguous frontier,
+    /// so a lost turn 0 cannot misclassify an armed peer as absent).
+    pub fn peer_has_spoken(&self, slot: usize) -> bool {
+        self.table.slot_has_any(slot)
     }
 
     /// `slot`'s recent turn lateness as `(median, p90)` steps, for the authority's
@@ -419,6 +440,17 @@ impl Session {
     /// The local player's slot.
     pub fn local_slot(&self) -> usize {
         self.local_slot
+    }
+
+    /// Fast-forwards the session past steps the engine already ran itself while the
+    /// client was waiting for the peer's first rollback turn (the arming handshake's
+    /// pending phase): `steps` is the engine's per-network-step turn count. Turns for
+    /// those steps were applied by the engine, so the session's input table drops them
+    /// and the confirmed frontier starts at `steps`.
+    pub fn advance_to(&mut self, steps: u32) {
+        self.table.advance_to(steps);
+        self.current = self.current.max(steps);
+        self.confirmed = self.confirmed.max(steps).min(self.current);
     }
 
     /// Drains the peer hash reports that arrived since the last call, as `(slot, frame, hash)`

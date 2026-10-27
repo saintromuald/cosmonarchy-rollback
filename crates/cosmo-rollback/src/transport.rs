@@ -19,7 +19,8 @@ use std::time::Instant;
 /// Bumped when the encoding changes; a peer with a different version is rejected rather
 /// than misparsed. Version 2 added the reporting slot to `Hash` (v1 was ambiguous about
 /// which peer a hash came from) and the authority's `LeadReport`/`TurnsComplete`.
-pub const WIRE_VERSION: u8 = 2;
+/// Version 3 added `Arm` (the arming handshake's deterministic flip frame).
+pub const WIRE_VERSION: u8 = 3;
 
 /// Largest turn blob accepted, to bound allocation from a hostile or corrupt peer. A turn
 /// is a frame's worth of commands; 4 KiB is far above anything the engine produces.
@@ -31,6 +32,7 @@ const TAG_LEAVE: u8 = 3;
 const TAG_LEAD_REPORT: u8 = 4;
 const TAG_TURNS_COMPLETE: u8 = 5;
 const TAG_ACK: u8 = 6;
+const TAG_ARM: u8 = 7;
 
 /// Slots the engine's turn scheduler can have; the authority's `TurnsComplete` reports one
 /// count per slot.
@@ -64,6 +66,12 @@ pub enum Msg {
     /// the clients permanently. The receiver therefore acknowledges and the sender re-sends
     /// everything above the ack (ADR-0006).
     Ack { slot: u8, seq: u32 },
+    /// The arming handshake: the host announces the sim frame at which both clients take
+    /// over driving (the flip). Both sides then flip at that exact frame, so their
+    /// sessions align deterministically no matter when the messages arrive. Sent by the
+    /// host once it has seen the guest's traffic, and re-sent until the flip (it travels
+    /// over plain UDP).
+    Arm { frame: u32 },
 }
 
 impl Msg {
@@ -73,6 +81,7 @@ impl Msg {
             Msg::Turn { frame, .. } | Msg::Hash { frame, .. } => *frame,
             Msg::Leave { step, .. } => *step,
             Msg::Ack { seq, .. } => *seq,
+            Msg::Arm { frame } => *frame,
             Msg::LeadReport { .. } | Msg::TurnsComplete { .. } => 0,
         }
     }
@@ -84,7 +93,7 @@ impl Msg {
             | Msg::Hash { slot, .. }
             | Msg::Leave { slot, .. }
             | Msg::Ack { slot, .. } => Some(*slot),
-            Msg::LeadReport { .. } | Msg::TurnsComplete { .. } => None,
+            Msg::LeadReport { .. } | Msg::TurnsComplete { .. } | Msg::Arm { .. } => None,
         }
     }
 
@@ -131,6 +140,10 @@ impl Msg {
                 out.push(TAG_ACK);
                 out.push(*slot);
                 out.extend_from_slice(&seq.to_le_bytes());
+            }
+            Msg::Arm { frame } => {
+                out.push(TAG_ARM);
+                out.extend_from_slice(&frame.to_le_bytes());
             }
         }
         out
@@ -199,6 +212,10 @@ impl Msg {
                 p += 1;
                 let seq = u32::from_le_bytes(take(&mut p, 4)?.try_into().ok()?);
                 Some((Msg::Ack { slot, seq }, p))
+            }
+            TAG_ARM => {
+                let frame = u32::from_le_bytes(take(&mut p, 4)?.try_into().ok()?);
+                Some((Msg::Arm { frame }, p))
             }
             _ => None,
         }
@@ -363,9 +380,20 @@ impl CrownLink {
 
 impl CrownLink {
     /// Hands one encoded message to the SNP.
+    ///
+    /// Turns, acks and the arming `Arm` are reliability-critical and travel over **both**
+    /// the direct P2P link and the relay (`cl_rollback_send_redundant`) — a relayed peer
+    /// whose direct path is blocked would otherwise never see them. Hash reports are
+    /// periodic and self-refreshing, so they use the plain broadcast (losing one only
+    /// delays the adjudication by one interval).
     fn transmit(&self, msg: &Msg) {
         let bytes = msg.encode();
-        let ok = unsafe { (self.api.broadcast)(bytes.as_ptr(), bytes.len() as u32) };
+        let ok = match msg {
+            Msg::Turn { .. } | Msg::Ack { .. } | Msg::Arm { .. } => unsafe {
+                (self.api.send_redundant)(bytes.as_ptr(), bytes.len() as u32)
+            },
+            _ => unsafe { (self.api.broadcast)(bytes.as_ptr(), bytes.len() as u32) },
+        };
         let n = SEND_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n <= 3 || n % 500 == 0 {
             crate::log::log(&format!(
@@ -660,6 +688,7 @@ mod tests {
         round_trip(Msg::TurnsComplete {
             counts: [1, 2, 3, 4, 5, 6, 7, 8],
         });
+        round_trip(Msg::Arm { frame: 0x1234_5678 });
     }
 
     #[test]

@@ -20,17 +20,14 @@
 # How many steps may run on prediction before the client stalls waiting for the peer.
 #CM_ROLLBACK_PREDICT=8
 #
-# Live steps whose turns the engine already applied before the client took over (the
-# match's "start game" + per-player init turns). Defaults to 2 in a real match (the
-# engine applies those itself; injecting them again replays init on an initialised
-# world and crashes) and 0 in the UDP/harness carriers.
-#CM_ROLLBACK_SKIP_START_TURNS=2
+# The client fast-forwards past the steps the engine ran itself before the arming
+# flip (derived from the engine's own turn counter); this knob adds an explicit
+# extra diagnostic skip on top of that. Default 0.
+#CM_ROLLBACK_SKIP_START_TURNS=0
 #
-# How long after takeover the client waits for the peer's first rollback turn before
-# falling back to normal lockstep (the peer is not running the plugin). Real matches
-# start both sides within milliseconds; only harnesses with sequential menu driving
-# need a generous value.
-#CM_ROLLBACK_PEER_GRACE=3
+# How many frames ahead of its announcement the host places the arming flip, so the
+# announcement reaches the guest before its sim passes the flip frame.
+#CM_ROLLBACK_ARM_MARGIN=8
 #
 # Diagnostics: drive a match that has a computer player anyway (aise state is not
 # snapshotted, so expect hash divergences while its script runs).
