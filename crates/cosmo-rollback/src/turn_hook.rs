@@ -355,11 +355,15 @@ pub fn walk_turn(bytes: &[u8]) -> (Vec<(u8, u32)>, bool) {
             return (out, false);
         }
         let len = unsafe { *(LENGTHS as *const u32).add(id as usize) };
-        out.push((id, len));
-        p += 1 + len as usize;
-        if p > bytes.len() {
+        // The table has no entry for the special sync commands (e.g.
+        // `GameCommand_Hash` 0x37 reads 0xFFFFFFFF here — the engine handles it by a
+        // dedicated path, not the generic walker), and a length that would run past
+        // the end is a malformed turn. Both are "incomplete", never an overflow.
+        if len as usize > bytes.len() - p - 1 {
             return (out, false);
         }
+        out.push((id, len));
+        p += 1 + len as usize;
     }
     (out, p == bytes.len())
 }
