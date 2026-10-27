@@ -97,6 +97,12 @@ pub fn desync_hash(snap: &Snapshot) -> u64 {
             h = mix(h, name, bytes);
         }
     }
+    // The scalar projections of the live pool objects (unit positions/hitpoints/orders/
+    // build queues, bullet positions) — the flat ranges above cannot cover the pools
+    // (their entries thread per-process pointers), and without these two clients that
+    // diverge inside a pool would hash identically: a silent desync.
+    let proj = crate::projection::pool_projection_hash();
+    h = mix(h, "pools", &proj.to_le_bytes());
     // The auxiliary blobs (tile flags, creep, image iscript) are deliberately **not** hashed
     // here. They are still snapshotted — a restore puts them back, which rollback needs — but
     // the outer main loop writes them *between* two logic frames (`CM_ROLLBACK_BOUNDARY` shows

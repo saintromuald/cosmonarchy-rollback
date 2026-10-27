@@ -38,23 +38,37 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         crop = Path(tmp) / "crop.png"
         base = Path(tmp) / "crop"
-        subprocess.run(
-            [
-                "magick", str(image),
-                "-crop", f"{CROP_W}x{CROP_H}+{CROP_X}+{CROP_Y}", "+repage",
-                "-resize", f"{SCALE * 100}%",
-                "-colorspace", "Gray",
-                "-normalize",
-                str(crop),
-            ],
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["tesseract", str(crop), str(base), "tsv", "--psm", "6"],
-            check=True,
-            capture_output=True,
-        )
+        try:
+            subprocess.run(
+                [
+                    "magick", str(image),
+                    "-crop", f"{CROP_W}x{CROP_H}+{CROP_X}+{CROP_Y}", "+repage",
+                    "-resize", f"{SCALE * 100}%",
+                    "-colorspace", "Gray",
+                    "-normalize",
+                    str(crop),
+                ],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError:
+            return 1
+        # Tesseract is flaky on small/degenerate crops: retry a few times and treat a
+        # persistent failure as "no match" instead of raising.
+        ok = False
+        for _ in range(3):
+            try:
+                subprocess.run(
+                    ["tesseract", str(crop), str(base), "tsv", "--psm", "6"],
+                    check=True,
+                    capture_output=True,
+                )
+                ok = True
+                break
+            except subprocess.CalledProcessError:
+                continue
+        if not ok:
+            return 1
 
         with open(f"{base}.tsv", newline="", encoding="utf-8") as file:
             rows = list(csv.DictReader(file, delimiter="\t"))

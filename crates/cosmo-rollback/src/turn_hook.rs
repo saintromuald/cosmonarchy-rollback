@@ -122,13 +122,14 @@ pub fn install(exe: &mut whack::ModulePatcher) {
                     // size so the flush sends the engine's empty-turn marker instead; the
                     // pipeline, the game-start loop and the acknowledgement plumbing all keep
                     // working (see `rollback/live.rs`).
-                    // Only in a match: zeroing the buffer in the lobby would also discard the
-                    // lobby's own turn payloads (the engine sends the map/lobby state over the
-                    // same turns), and the joiner would never receive the map. After a
-                    // lockstep fallback the engine's own turns flow again untouched.
+                    // Only in a match, and only while the client is *driving*: zeroing the
+                    // buffer in the lobby would also discard the lobby's own turn payloads
+                    // (the engine sends the map/lobby state over the same turns), and the
+                    // joiner would never receive the map. During the arming pending phase
+                    // and after a handoff the engine's own turns flow untouched.
                     if crate::rollback::live::enabled()
                         && crate::rollback::live::in_game()
-                        && !crate::rollback::live::fallen_back()
+                        && crate::rollback::live::driving()
                     {
                         *(G_COMMAND_QUEUE_SIZE as *mut u32) = 0;
                     }
@@ -241,7 +242,13 @@ fn read_local_turn() -> (u32, Vec<u8>) {
 }
 
 /// Capture the local turn into [`CAPTURED`], called at the `FillPipeline` entry.
+///
+/// The live client reads the buffer directly (`local_turn`), so its captures are not
+/// enqueued — the queue would grow without a consumer for the whole session.
 fn capture_local_turn() {
+    if crate::rollback::live::enabled() {
+        return;
+    }
     let (frame, bytes) = read_local_turn();
     if let Ok(mut q) = CAPTURED.lock() {
         q.push_back((frame, bytes.clone()));

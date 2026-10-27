@@ -62,10 +62,11 @@ PY
     if [[ -n "$slot" ]]; then
         export CM_ROLLBACK_LIVE=1
         export CM_ROLLBACK_SLOT="$slot"
-        export CM_ROLLBACK_NO_PLUGIN=1
-        # The engine applies the match's start turns itself before the client takes over;
-        # injecting them again replays game init on an initialised world.
-        export CM_ROLLBACK_SKIP_START_TURNS="${CM_ROLLBACK_SKIP_START_TURNS:-2}"
+        # Plugin-state snapshots are excluded by default (the shipped plugins have no
+        # serializers); CM_ROLLBACK_NO_PLUGIN=0 runs the shipped-match configuration.
+        if [[ "${CM_ROLLBACK_NO_PLUGIN:-}" != "0" ]]; then
+            export CM_ROLLBACK_NO_PLUGIN=1
+        fi
         # One-way delay on our own channel messages, so a same-machine match still mispredicts
         # and therefore exercises prediction + rollback for real.
         if [[ -n "${CL_SEND_DELAY_MS:-}" ]]; then
@@ -102,7 +103,7 @@ goto_map_root() { # session
     local s="$1" i label xy
     for i in 1 2 3 4 5 6; do
         shot "$s" "maproot-$i"
-        label="$(python3 "$ROOT/tools/ocr_text.py" "$(state "$s")/maproot-$i.png" 240 150 340 30 7)"
+        label="$(python3 "$ROOT/tools/ocr_text.py" "$(state "$s")/maproot-$i.png" 240 140 360 60 7)"
         # The pixel font reads "CMBW-maps" as e.g. "CNVBW -maps", so match loosely: the root is
         # the only level whose folder label contains "maps" ("melee", "replays", a class
         # folder, ... do not).
@@ -132,28 +133,29 @@ open_multiplayer() { # session [profile]
         # A tree with several profiles shows the chooser (New/Delete/Ok/Cancel): Enter
         # accepts the highlighted profile (the chooser has focus at this point), which
         # proceeds straight to the games list.
-        chooser="$(python3 "$ROOT/tools/ocr_text.py" "$(state "$s")/registry.png" 290 460 700 170 7 2>/dev/null)"
+        chooser="$(python3 "$ROOT/tools/ocr_text.py" "$(state "$s")/registry.png" 290 440 700 200 6 2>/dev/null)"
         if [[ "$chooser" == *[Nn]ew* && "$chooser" == *[Dd]elete* ]]; then
             "$S" key "$s" Return
             sleep 4
             echo "  profile chooser accepted"
-        else
-            click "$s" 931 589 6  # games list -> Ok
         fi
     fi
 }
 
 host_steps() { # session
-    local s="$1"
+    local s="$1" xy x y
     open_multiplayer "$s" "${CL_HOST_PROFILE:-alpha}"
     shot "$s" mp
-    click "$s" 350 514 6     # Create Game
+    click "$s" 353 500 6     # Create Game
     shot "$s" create
     goto_map_root "$s" || echo "  warning: map browser not at its root"
-    dblclick "$s" 321 266    # [melee]
-    dblclick "$s" 309 210    # [1v1]
-    dblclick "$s" 397 237    # [Class 0 - Testing Grounds]
-    dblclick "$s" 383 210    # [1. Standard-Bearers]
+    # Walk the folder levels by OCR (the rows drifted from the old fixed coordinates).
+    for folder in "melee" "1v1" "Class 0 - Testing Grounds" "1. Standard-Bearers"; do
+        xy="$(pick_map "$s" "$folder")" || { shot "$s" "mapnav-$folder"; die "folder '$folder' not found"; }
+        read -r x y <<<"$xy"
+        onscreen "$s" xdotool mousemove "$x" "$y" click --repeat 2 --delay 150 1
+        sleep 3
+    done
     shot "$s" maplist
     # The lobby carries only the map's *name*, and this install has maps whose names collide
     # after the version suffix is stripped (two "Pagan Imperium"), which makes the joiner load
@@ -164,7 +166,7 @@ host_steps() { # session
     read -r mx my <<<"$xy"
     onscreen "$s" xdotool mousemove "$mx" "$my" click 1
     sleep 2
-    click "$s" 931 589 8     # Ok -> lobby
+    click "$s" 887 558 8     # Ok -> lobby
     shot "$s" lobby
 }
 
@@ -183,7 +185,7 @@ join_steps() { # session game
         sleep 2
     done
     [[ "${title,,}" == *"${want,,}"* ]] || die "could not select '$want' (last title '$title')"
-    click "$s" 931 589 12    # Ok -> join
+    click "$s" 900 559 12    # Ok -> join
     shot "$s" joined
 }
 
@@ -211,7 +213,7 @@ run)
     host_steps "$HOST_S"
     join_steps "$JOIN_S" "$GAME"
     echo "run: lobby ready (host $HOST_S, joiner $JOIN_S); starting the game"
-    click "$HOST_S" 931 589 5   # lobby Ok starts the match
+    click "$HOST_S" 900 559 5   # lobby Ok starts the match
     sleep "${CM_START_WAIT:-45}"
     shot "$HOST_S" ingame
     shot "$JOIN_S" ingame
