@@ -584,7 +584,17 @@ impl Live {
         // 2. The local turn for the step this frame runs: read it now, before the frame's
         //    flush clears the buffer. The engine's own send is suppressed, so this is the only
         //    way it reaches the peer.
-        let local = crate::turn_hook::local_turn();
+        let mut local = crate::turn_hook::local_turn();
+        // A turn that *starts* with `GameCommand_Hash` (0x37) is the engine's own
+        // transport-level sync marker, not simulation input: the buffer holds exactly that
+        // when the player issued nothing this turn (the replay harness, or an idle real
+        // frame). It is never a sim command — `command_lengths[0x37]` reads the table's
+        // "no length" sentinel (the dispatcher special-cases it) — so injecting it through
+        // `ProcessCommands` risks feeding the hash handler a short payload. Replace it with
+        // the engine's own empty-turn marker (0x05), which is what the flush would send.
+        if local.first() == Some(&0x37) {
+            local = vec![crate::turns::SYNC_NOP];
+        }
         match self.link.as_mut() {
             Some(link) => self.session.send_local_turn(link, current, local, now),
             None => {
