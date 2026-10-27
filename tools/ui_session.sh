@@ -54,6 +54,10 @@ start)
         for var in $(env | grep -o '^CM_ROLLBACK_[A-Z0-9_]*'); do
             export "$var"
         done
+        # The wine sync backend (ntsync wedges after a kill-storm; esync works).
+        if [[ -n "${WINENT_SYNC:-}" ]]; then
+            export WINENT_SYNC
+        fi
         WINEPREFIX="$GAME_ROOT/prefix" PROTONPATH=GE-Proton \
         GAMEID="umu-cosmo-$NAME-$BUILD" PROTON_VERB=waitforexitandrun \
         DISPLAY="$DISPLAY_NUM" WAYLAND_DISPLAY= setsid umu-run "C:\\Cosmonarchy\\$BUILD\\Cosmonarchy BW.exe" \
