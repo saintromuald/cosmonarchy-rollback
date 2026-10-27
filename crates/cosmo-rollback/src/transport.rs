@@ -489,13 +489,20 @@ impl Link for UdpLink {
 
     fn recv(&mut self) -> Option<Msg> {
         // Release the datagrams whose delay has expired, then take one that arrived.
+        // The release is capped per call: a long backlog released in one burst would
+        // overflow the peer's socket receive buffer (a loopback burst of ~2k datagrams
+        // loses most of them), and the caller recv()s every tick anyway.
         let now = Instant::now();
-        while let Some((at, _)) = self.pending.front() {
-            if *at > now {
-                break;
+        let mut released = 0usize;
+        while released < 64 {
+            match self.pending.front() {
+                Some((at, _)) if *at <= now => {
+                    let bytes = self.pending.pop_front().expect("front").1;
+                    let _ = self.socket.send_to(&bytes, self.peer);
+                    released += 1;
+                }
+                _ => break,
             }
-            let bytes = self.pending.pop_front().expect("front").1;
-            let _ = self.socket.send_to(&bytes, self.peer);
         }
         let mut buf = [0u8; 2048];
         match self.socket.recv_from(&mut buf) {
@@ -752,5 +759,67 @@ mod tests {
         l.tick();
         assert_eq!(l.recv().unwrap().frame(), 1);
         assert_eq!(l.recv().unwrap().frame(), 2);
+    }
+
+    /// A delayed UDP link under a flood must not lose the turns sent before the flood
+    /// (regression: the two-client harness saw the flip's first turns vanish while
+    /// thousands of pending-phase sends were released around them).
+    #[test]
+    fn delayed_udp_link_does_not_lose_early_turns_under_a_flood() {
+        use std::time::Duration;
+        let mut tx = UdpLink::new(39501, 39502, Duration::from_millis(120))
+            .expect("bind tx");
+        let mut rx = UdpLink::new(39502, 39501, Duration::ZERO).expect("bind rx");
+        // The flood: 2000 messages, as the pending phase sends one per tick.
+        for i in 0..2000u32 {
+            tx.send(Msg::Turn { slot: 1, frame: i, bytes: vec![9] });
+        }
+        // The early turns the flip sends.
+        for i in 0..16u32 {
+            tx.send(Msg::Turn { slot: 1, frame: 10_000 + i, bytes: vec![7] });
+        }
+        // Let the delay elapse, then release the queue in bursts as the stalled ticks
+        // would, while the receiver drains.
+        std::thread::sleep(Duration::from_millis(200));
+        let mut seen_early = std::collections::HashSet::new();
+        let mut seen_flood = 0u32;
+        for _ in 0..8000 {
+            tx.recv();
+            while let Some(m) = rx.recv() {
+                if let Msg::Turn { frame, .. } = m {
+                    if (10_000..10_016).contains(&frame) {
+                        seen_early.insert(frame);
+                    } else if frame < 2000 {
+                        seen_flood += 1;
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        tx.recv();
+        while let Some(m) = rx.recv() {
+            if let Msg::Turn { frame, .. } = m {
+                if (10_000..10_016).contains(&frame) {
+                    seen_early.insert(frame);
+                } else if frame < 2000 {
+                    seen_flood += 1;
+                }
+            }
+        }
+        // The flood and the early turns are all small datagrams on a loopback socket:
+        // nothing should be lost. The flood itself may be sampled rather than counted
+        // exactly, but the early turns must all arrive.
+        assert_eq!(
+            seen_early.len(),
+            16,
+            "expected all 16 early turns, got {}: {:?} (flood arrivals sampled: {})",
+            seen_early.len(),
+            {
+                let mut v: Vec<u32> = seen_early.into_iter().collect();
+                v.sort();
+                v
+            },
+            seen_flood,
+        );
     }
 }

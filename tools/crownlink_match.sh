@@ -149,24 +149,29 @@ host_steps() { # session
     click "$s" 353 500 6     # Create Game
     shot "$s" create
     goto_map_root "$s" || echo "  warning: map browser not at its root"
-    # Walk the folder levels by OCR (the rows drifted from the old fixed coordinates).
+    # Walk the folder levels by OCR: a single click selects the row and Enter opens it
+    # (the browser's Ok button does not open folders at every level, and the rows have
+    # drifted from the old fixed coordinates).
     for folder in "melee" "1v1" "Class 0 - Testing Grounds" "1. Standard-Bearers"; do
         xy="$(pick_map "$s" "$folder")" || { shot "$s" "mapnav-$folder"; die "folder '$folder' not found"; }
         read -r x y <<<"$xy"
-        onscreen "$s" xdotool mousemove "$x" "$y" click --repeat 2 --delay 150 1
-        sleep 3
+        onscreen "$s" xdotool mousemove "$x" "$y" click 1
+        sleep 2
+        "$S" key "$s" Return
+        sleep 4
     done
     shot "$s" maplist
     # The lobby carries only the map's *name*, and this install has maps whose names collide
     # after the version suffix is stripped (two "Pagan Imperium"), which makes the joiner load
     # the wrong file and fail the join. Pick a map whose name is unique.
-    local map="${CL_MAP:-Potivector}"
+    local map="${CL_MAP:-Sylphid}"
     local xy mx my
     xy="$(pick_map "$s" "$map")" || { shot "$s" maplist-fail; die "map '$map' not found"; }
     read -r mx my <<<"$xy"
     onscreen "$s" xdotool mousemove "$mx" "$my" click 1
     sleep 2
-    click "$s" 887 558 8     # Ok -> lobby
+    "$S" key "$s" Return
+    sleep 5
     shot "$s" lobby
 }
 
