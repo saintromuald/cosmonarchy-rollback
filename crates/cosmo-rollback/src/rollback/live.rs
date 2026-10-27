@@ -210,6 +210,9 @@ pub struct Live {
     /// The sim frame at which the client starts driving (the host's `Arm` announcement,
     /// or the host's own choice). `None` while pending.
     arm_frame: Option<u32>,
+    /// The local turn last sent over the channel while pending (dedup: the buffer is
+    /// re-sent only on change).
+    pending_sent: Option<Vec<u8>>,
     /// Whether the client injects turns itself. Always true while driving: the engine's
     /// turn processor is no-op'd in live mode and the rollback channel never enters the
     /// engine's lockstep queue, so the client is the only applier of turns on every
@@ -236,6 +239,9 @@ pub struct Live {
     session_limit: u32,
     /// Wall time the current run of stalls started, for the peer-loss handoff.
     stall_since: Option<Instant>,
+    /// The last time any channel message arrived (the peer-loss handoff requires a
+    /// stall run with *no* traffic — stalls with live traffic are normal pacing).
+    last_traffic: Option<Instant>,
     /// The newest confirmed frame whose hash we have sent.
     hash_reported: u32,
     /// Report a desync hash every this many confirmed frames (ADR-0001 §1.1 says 8; a smaller
@@ -490,10 +496,12 @@ impl Live {
             remote_slot: remote,
             session_limit: limit,
             stall_since: None,
+            last_traffic: None,
             started_at: None,
             no_peer: false,
             takeover_turn: 0,
             arm_frame: None,
+            pending_sent: None,
             skip_start,
             live_steps: 0,
             rolls: 0,
@@ -564,8 +572,10 @@ impl Live {
         self.ai_present = false;
         self.started_at = None;
         self.stall_since = None;
+        self.last_traffic = None;
         self.takeover_turn = 0;
         self.arm_frame = None;
+        self.pending_sent = None;
         self.live_steps = 0;
         self.hash_reported = 0;
         self.desync_logged = None;
@@ -663,10 +673,16 @@ impl Live {
         } else {
             // Send the local turn so the peer can see we are armed. (The engine's own
             // lockstep stream also carries it; this channel copy is what the handshake
-            // keys on, and the flip's `advance_to` drops these pre-flip turns.)
+            // keys on, and the flip's `advance_to` drops these pre-flip turns.) The
+            // turn is sent only when its bytes change: the pending phase can last tens
+            // of seconds (a slow peer), and sending the same buffer every tick would
+            // flood the channel for nothing.
             let local = strip_sync_markers(crate::turn_hook::local_turn());
-            if let Some(link) = self.link.as_mut() {
-                self.session.send_local_turn(link, self.session.current(), local, now);
+            if self.pending_sent.as_deref() != Some(local.as_slice()) {
+                self.pending_sent = Some(local.clone());
+                if let Some(link) = self.link.as_mut() {
+                    self.session.send_local_turn(link, self.session.current(), local, now);
+                }
             }
             if self.no_peer || self.ai_present {
                 return unsafe { orig(ecx) };
@@ -752,7 +768,9 @@ impl Live {
 
         // 1. Absorb the peer's messages. Turns go into the input table by sequence number.
         if let Some(link) = self.link.as_mut() {
-            self.session.absorb(link, now);
+            if self.session.absorb(link, now) > 0 {
+                self.last_traffic = Some(now);
+            }
         }
         // A desync the peer's hash just revealed: dump a per-range fingerprint of our own state
         // so the two clients' logs can be diffed to find the range that differs, then hand the
@@ -847,20 +865,20 @@ impl Live {
                     self.session.confirmed(),
                 ));
             }
-            // A peer that once spoke and then went silent (mid-match disconnect, crash,
+            // A peer that once spoke and then went **silent** (mid-match disconnect, crash,
             // network drop) would stall the simulation forever: the prediction limit can
-            // never absorb a turn that will not come. After a grace of consecutive stalls
-            // the match is handed back to the engine — its own turn path resumes and its
-            // native disconnect handling shows. (The scripted harness peer never goes
-            // silent, and a not-yet-seen peer is the no-peer fallback's business.)
+            // never absorb a turn that will not come. After a grace of continuous stalls
+            // *with no channel traffic at all*, the match is handed back to the engine —
+            // its own turn path resumes and its native disconnect handling shows. (The
+            // scripted harness peer never goes silent, and a not-yet-seen peer is the
+            // pending phase's business.) Stalls with live traffic — turns merely late
+            // beyond the prediction window — are normal pacing and never hand off.
             if !self.scripted {
-                let stalled_for = self
-                    .stall_since
-                    .get_or_insert_with(Instant::now)
-                    .elapsed();
-                if stalled_for >= PEER_LOSS_TIMEOUT {
+                let stalled_since = *self.stall_since.get_or_insert_with(Instant::now);
+                let alive = self.last_traffic.is_some_and(|t| t >= stalled_since);
+                if !alive && stalled_since.elapsed() >= PEER_LOSS_TIMEOUT {
                     log(
-                        "[cosmo-rollback] live: the peer stopped responding for over \
+                        "[cosmo-rollback] live: no traffic from the peer for over \
                          {PEER_LOSS_TIMEOUT:?}; handing the match back to the engine's turn \
                          path (its native disconnect handling takes over)",
                     );

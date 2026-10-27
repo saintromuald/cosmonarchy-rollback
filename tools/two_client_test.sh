@@ -97,7 +97,7 @@ launch() { # root display local_port peer_port slot gameid out
         CM_ROLLBACK_UDP="$local_port:$peer_port:$DELAY" \
         CM_ROLLBACK_NO_PLUGIN=1 \
         CM_ROLLBACK_HASH_EVERY="${HASH_EVERY:-4}" \
-        env ${ALLOW_AI:+CM_ROLLBACK_ALLOW_AI=1} \
+        env ${ALLOW_AI:+CM_ROLLBACK_ALLOW_AI=1} ${CM_ROLLBACK_LOG_ABSORB:+CM_ROLLBACK_LOG_ABSORB=1} \
         DISPLAY="$display" WAYLAND_DISPLAY= setsid umu-run "C:\\Cosmonarchy\\$BUILD\\Cosmonarchy BW.exe" \
             >"$out" 2>&1 </dev/null
     ) >/dev/null 2>&1 &

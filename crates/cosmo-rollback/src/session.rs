@@ -150,10 +150,21 @@ impl Session {
     /// Takes every message the link has for us: turns go into the input table **by sequence
     /// number** (the wire is lossy and unordered), peer hashes into the desync comparison,
     /// and leaves into the leave schedule. The engine-facing caller runs this once per
-    /// frame, before [`plan`](Self::plan).
-    pub fn absorb(&mut self, link: &mut impl crate::transport::Link, now: Instant) {
+    /// frame, before [`plan`](Self::plan). Returns how many messages were absorbed.
+    pub fn absorb(&mut self, link: &mut impl crate::transport::Link, now: Instant) -> usize {
         use crate::transport::Msg;
+        let mut taken = 0usize;
+        static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         while let Some(msg) = link.recv() {
+            taken += 1;
+            if let Msg::Turn { slot, frame, bytes } = &msg {
+                if std::env::var("CM_ROLLBACK_LOG_ABSORB").is_ok() {
+                    crate::log::log(&format!(
+                        "[cosmo-rollback] absorb turn #{taken}: slot {slot} frame {frame} len {}",
+                        bytes.len()
+                    ));
+                }
+            }
             match msg {
                 Msg::Turn { slot, frame, bytes } => {
                     self.push_remote_seq(slot as usize, frame, bytes, now)
@@ -182,6 +193,7 @@ impl Session {
                 Msg::TurnsComplete { counts } => self.authority_turns = Some(counts),
             }
         }
+        taken
     }
 
     /// The authority's most recent `(median_lateness, p90_lateness, clock_stopped_ms)`.
