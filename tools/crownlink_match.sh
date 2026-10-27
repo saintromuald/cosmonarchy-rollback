@@ -6,9 +6,13 @@
 # menu occupies x=160..1120.
 #
 #   tools/crownlink_match.sh run   [host_session] [host_display] [host_root] [join_session] [join_display] [join_root] [game]
-#   tools/crownlink_match.sh host  <session> <display> <root>          (game must already be up)
-#   tools/crownlink_match.sh join  <session> <display> <root> [game]   (game must already be up)
+#   tools/crownlink_match.sh host  <session> <display> <root> [slot]          (game must already be up)
+#   tools/crownlink_match.sh join  <session> <display> <root> [slot] [game]   (game must already be up)
 #   tools/crownlink_match.sh boot  <session> <display> <root>
+#
+# `host`/`join` take an optional slot (0/1): passing one arms the live client
+# (CM_ROLLBACK_LIVE + CM_ROLLBACK_SLOT), which is how a two-machine match arms each
+# side — see tools/crownlink_cross.sh.
 #
 # `run` starts both clients first and only then drives them: restarting a session while the
 # other is in a lobby tears the lobby down (wine/proton teardown is not prefix-scoped in
@@ -112,7 +116,7 @@ goto_map_root() { # session
 }
 
 open_multiplayer() { # session [profile]
-    local s="$1" name="${2:-alpha}" title
+    local s="$1" name="${2:-alpha}" title chooser
     click "$s" 361 298 4     # Multiplayer
     # A fresh install has no profile: the registry asks for a name first. Create one so the
     # harness works on a clean copy (a real player does this once, by hand).
@@ -123,8 +127,20 @@ open_multiplayer() { # session [profile]
         "$S" key "$s" Return
         sleep 2
         echo "  created profile '$name'"
+        click "$s" 931 589 6     # Registry -> Ok
+    else
+        # A tree with several profiles shows the chooser (New/Delete/Ok/Cancel): Enter
+        # accepts the highlighted profile (the chooser has focus at this point), which
+        # proceeds straight to the games list.
+        chooser="$(python3 "$ROOT/tools/ocr_text.py" "$(state "$s")/registry.png" 290 460 700 170 7 2>/dev/null)"
+        if [[ "$chooser" == *[Nn]ew* && "$chooser" == *[Dd]elete* ]]; then
+            "$S" key "$s" Return
+            sleep 4
+            echo "  profile chooser accepted"
+        else
+            click "$s" 931 589 6  # games list -> Ok
+        fi
     fi
-    click "$s" 931 589 6     # Registry -> Ok
 }
 
 host_steps() { # session
@@ -173,12 +189,12 @@ join_steps() { # session game
 
 case "$CMD" in
 host|join|boot)
-    NAME="${2:-}"; DISPLAY_NUM="${3:-}"; GAME_ROOT="${4:-}"
-    [[ -n "$NAME" && -n "$DISPLAY_NUM" && -n "$GAME_ROOT" ]] || die "usage: $0 $CMD <session> <display> <root>"
-    boot_session "$NAME" "$DISPLAY_NUM" "$GAME_ROOT"
+    NAME="${2:-}"; DISPLAY_NUM="${3:-}"; GAME_ROOT="${4:-}"; SLOT="${5:-${CM_SLOT:-}}"
+    [[ -n "$NAME" && -n "$DISPLAY_NUM" && -n "$GAME_ROOT" ]] || die "usage: $0 $CMD <session> <display> <root> [slot] [game]"
+    boot_session "$NAME" "$DISPLAY_NUM" "$GAME_ROOT" "$SLOT"
     case "$CMD" in
         host) host_steps "$NAME" ;;
-        join) join_steps "$NAME" "${5:-alpha}" ;;
+        join) join_steps "$NAME" "${6:-alpha}" ;;
     esac
     ;;
 run)
