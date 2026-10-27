@@ -190,6 +190,17 @@ by screenshot at `00:00:10`). Three separate bugs had to fall out to get here:
    store), **false for CrownLink**.
    The `Box<dyn Link + Send>` impl must forward that method — its default silently re-enabled
    injection and cost a debugging cycle.
+
+> **Correction (2026-10-27).** That "engine applies turns" model was later broken by the
+> refactor that made the live client the sole turn applier: `install` no-ops the engine's
+> turn processor (`0x00486F50`) once the match is running, and the rollback channel's packets
+> never enter the engine's lockstep queue (RollbackChannel.h sub-type divert). With
+> `inject_turns() == false` for CrownLink, **nobody applied the peer's turns** — a live match
+> ran on empty input (the dead mouse/keyboard symptom). The double-apply hazard is handled the
+> correct way: the client injects every slot's turn on **every** carrier, the engine applies
+> none (the processor is no-op'd), and the match's init turns — the only ones the engine does
+> apply before takeover — are skipped via `CM_ROLLBACK_SKIP_START_TURNS` (default 2 on a real
+> carrier). `inject_turns()` is now uniformly `true`.
 2. **Taking over too early replayed the match's init turns.** The engine applies the "start
    game" and per-player init commands before the client takes over; re-injecting them replays
    game init on an initialised world. `CM_ROLLBACK_SKIP_START_TURNS` (default 2) skips those
@@ -249,11 +260,14 @@ excludes the same range from its cross-client hash.
 
 ### AI matches are refused, not desynced
 
-`live` checks `first_ai_script` (`0x0068C100`) at takeover. A non-zero value means an AI script
-is running, i.e. a computer player is in the match; its state lives inside `aise`, outside the
-engine snapshot, so a re-simulation would make different decisions. The client then logs
-`AI script present … passing frames through` and runs normal lockstep instead of driving.
-Melee matches read zero (verified: the guard does not trigger in the passing runs above).
+`live` scans the `players` array (`0x0057EEE0`, `Player.player_type` at +0x08, stride 0x24)
+at takeover for a `PlayerType::Computer` (1) slot. A computer player's state lives inside
+`aise`, outside the engine snapshot, so a re-simulation would make different decisions. The
+client then logs `computer player present … passing frames through` and runs normal lockstep
+instead of driving. The earlier `first_ai_script` (`0x0068C100`) test was too broad: neutral
+critters and mod script units also run AI scripts, which would wrongly refuse every ordinary
+human game. `CM_ROLLBACK_ALLOW_AI=1` drives anyway (diagnostic / farm soak; expect hash
+divergences while the AI runs).
 
 ### Negative / unverified
 

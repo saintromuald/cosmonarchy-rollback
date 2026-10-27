@@ -42,6 +42,14 @@ if [ "$CX" != "none" ]; then
     IFS=';' read -ra CLICKS <<< "$CX"
     for c in "${CLICKS[@]}"; do
         [ "$c" = "none" ] && continue
+        # "key:Return" sends a key instead of a click, for dialogs the fixed click
+        # positions cannot reach (e.g. the profile chooser on a tree with several
+        # profiles: Enter selects the highlighted one).
+        if [[ "$c" == key:* ]]; then
+            DISPLAY="$DISPLAY_NUM" xdotool key "${c#key:}"
+            sleep 5
+            continue
+        fi
         x="${c%,*}"
         y="${c#*,}"
         DISPLAY="$DISPLAY_NUM" xdotool mousemove "$x" "$y" click 1

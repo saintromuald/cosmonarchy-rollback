@@ -214,11 +214,14 @@ pub trait Link {
 
     /// Whether the client must inject turns into the engine itself.
     ///
-    /// True for carriers with no engine-side turn source: the scripted replay harness and the
-    /// UDP test, where the peer's turns exist only in our input table. False for CrownLink: the
-    /// engine receives the peer's turns through the `.snp` and applies them itself, so injecting
-    /// the recorded copy as well applies every command twice — which crashes inside
-    /// `ProcessCommands` once the match's init turns are replayed.
+    /// Always true for a live carrier. The engine's own turn processor
+    /// (`0x00486F50`) is no-op'd by the live client (`rollback/live.rs::install`), and
+    /// CrownLink's rollback channel carries its packets under a dedicated sub-type that
+    /// **never enters the engine's lockstep receive queue** (RollbackChannel.h), so the
+    /// only thing that can ever apply a peer's turns to the simulation is the client's
+    /// own `ProcessCommands` injection. Leaving it to "the engine" would apply nothing —
+    /// the live match would run on empty input on both sides (the dead
+    /// mouse/keyboard symptom).
     fn inject_turns(&self) -> bool {
         true
     }
@@ -385,7 +388,12 @@ impl CrownLink {
 
 impl Link for CrownLink {
     fn inject_turns(&self) -> bool {
-        false
+        // The live client injects every slot's turn on every carrier. The double-apply
+        // hazard that once motivated `false` here is handled the correct way: the
+        // match's start turns (which the engine applies itself before the client takes
+        // over) are skipped via `CM_ROLLBACK_SKIP_START_TURNS`, and the engine's turn
+        // processor is no-op'd so nothing else re-applies what the client injects.
+        true
     }
 
     fn send(&mut self, msg: Msg) {
@@ -417,6 +425,11 @@ pub struct UdpLink {
     pending: VecDeque<(Instant, Vec<u8>)>,
 }
 
+/// Traffic counters, matching CrownLink's channel counters so the two-client report
+/// (`tools/crownlink_match.sh report`) reads either carrier.
+static UDP_SEND_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static UDP_RECV_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 impl UdpLink {
     /// Binds `local` and sends to `127.0.0.1:peer`.
     pub fn new(local: u16, peer: u16, delay: std::time::Duration) -> Option<Self> {
@@ -435,6 +448,10 @@ impl UdpLink {
 impl Link for UdpLink {
     fn send(&mut self, msg: Msg) {
         let bytes = msg.encode();
+        let n = UDP_SEND_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 3 || n % 500 == 0 {
+            crate::log::log(&format!("[cosmo-rollback] live: channel send #{n} ({} bytes)", bytes.len()));
+        }
         if self.delay.is_zero() {
             let _ = self.socket.send_to(&bytes, self.peer);
         } else {
@@ -455,7 +472,15 @@ impl Link for UdpLink {
         let mut buf = [0u8; 2048];
         match self.socket.recv_from(&mut buf) {
             // A malformed datagram is dropped, never fatal.
-            Ok((n, _)) => Msg::decode(&buf[..n]).map(|(m, _)| m),
+            Ok((len, _)) => {
+                let n = UDP_RECV_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n <= 3 || n % 500 == 0 {
+                    crate::log::log(&format!(
+                        "[cosmo-rollback] live: channel recv #{n} ({len} bytes)"
+                    ));
+                }
+                Msg::decode(&buf[..len]).map(|(m, _)| m)
+            }
             Err(_) => None,
         }
     }

@@ -1,14 +1,27 @@
 #!/usr/bin/env bash
 # Two clients on one machine, rollback turns carried over UDP (no CrownLink provider needed).
 #
-# Both clients load the *same* map from the single-player menu, so their initial state is
+# Both clients load the *same* replay from the single-player menu, so their initial state is
 # identical; the client then drives the simulation from its own input table and exchanges
 # turns/hashes/acks over a real UDP socket. A delay makes turns arrive late, so prediction and
 # rollback actually run.
 #
+# The menu is driven with the mod's current layout: [profile dialog -> Enter], Single Player,
+# [profile dialog -> Enter], Replay, then the LastReplay row is located by OCR and Ok starts
+# it. The two clients finish their menus at different times, so the peer grace is generous
+# (CM_ROLLBACK_PEER_GRACE, default 90 s) — without it the first client would fall back to
+# lockstep before the second one even loads.
+#
 #   tools/two_client_test.sh [Build] [delay_ms] [boot_secs] [post_secs]
 #
-# Requires two game trees (COSMO_GAME_A / COSMO_GAME_B) with the plugin installed.
+# `CL_REPLAY=name` picks the replay row (default LastReplay). `ALLOW_AI=1` drives a
+# replay with a computer player anyway: transport/prediction/rollback/adjudication are
+# all exercised, with the expected hash divergence as the proof of adjudication
+# (PASS-TRANSPORT verdict).
+#
+# Requires two game trees (COSMO_GAME_A / COSMO_GAME_B) with the plugin installed. The trees
+# must be real separate copies — the default ~/Games/cosmonarchy-agent3 was once a symlink to
+# agent2, which makes both clients share one wine prefix and corrupt the run.
 #
 # Determinism: the menu click that selects a game picks whatever the prefix's "Recent Maps"
 # holds first, and that is per sandbox — so the script pins it (and the replay list, whose
@@ -19,6 +32,10 @@ BUILD="${1:-Release}"
 DELAY="${2:-120}"
 BOOT="${3:-110}"
 POST="${4:-60}"
+# The replay both clients load (must exist at the top level of
+# Maps/replays/ in both trees and be human-vs-human — a computer player makes
+# the live client pass frames through by design).
+CL_REPLAY="${CL_REPLAY:-LastReplay}"
 A_ROOT="${COSMO_GAME_A:-$HOME/Games/cosmonarchy-agent2}"
 B_ROOT="${COSMO_GAME_B:-$HOME/Games/cosmonarchy-agent3}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -80,10 +97,15 @@ launch() { # root display local_port peer_port slot gameid out
         CM_ROLLBACK_UDP="$local_port:$peer_port:$DELAY" \
         CM_ROLLBACK_NO_PLUGIN=1 \
         CM_ROLLBACK_HASH_EVERY="${HASH_EVERY:-4}" \
+        CM_ROLLBACK_PEER_GRACE="${PEER_GRACE:-90}" \
+        env ${ALLOW_AI:+CM_ROLLBACK_ALLOW_AI=1} \
         DISPLAY="$display" WAYLAND_DISPLAY= setsid umu-run "C:\\Cosmonarchy\\$BUILD\\Cosmonarchy BW.exe" \
             >"$out" 2>&1 </dev/null
     ) >/dev/null 2>&1 &
 }
+
+# `ALLOW_AI=1` drives a replay with a computer player anyway (aise state is not
+# snapshotted, so the two clients' hashes will diverge — the verdict below expects that).
 
 wait_loaded() { # log timeout_secs
     local log="$1" timeout="${2:-150}" waited=0
@@ -102,11 +124,24 @@ launch "$B_ROOT" :95 "$PORT_B" "$PORT_A" 1 "umu-cosmo-b-$BUILD" "$LOG/run-b.log"
 wait_loaded "$B_LOG" 150 || echo "warning: client B did not load in time"
 
 sleep "$BOOT"
+# Drive both clients into the same replay, with the mod's current menu layout:
+#   [profile dialog?] -> Enter  ->  Single Player  ->  [profile dialog?] -> Enter
+#   ->  Replay  ->  pick the LastReplay row (OCR)  ->  Ok
+# The old fixed click sequence no longer matches the menu (the profile chooser and
+# the single-player screens moved), so the row is located with ocr_row.py.
 for d in :96 :95; do
-    for c in "490,182" "940,590" "320,645" "350,238" "940,590"; do
-        DISPLAY="$d" xdotool mousemove "${c%,*}" "${c#*,}" click 1
-        sleep 5
-    done
+    DISPLAY="$d" xdotool key --clearmodifiers Return; sleep 5
+    DISPLAY="$d" xdotool mousemove 490 207 click 1; sleep 5
+    DISPLAY="$d" xdotool key --clearmodifiers Return; sleep 5
+    DISPLAY="$d" xdotool mousemove 200 652 click 1; sleep 6
+    DISPLAY="$d" import -window root "/tmp/opencode/tc-$d.png" 2>/dev/null
+    ROW="$(python3 "$ROOT/tools/ocr_row.py" "/tmp/opencode/tc-$d.png" "$CL_REPLAY" 300 140 420 300 || true)"
+    if [[ -n "$ROW" ]]; then
+        DISPLAY="$d" xdotool mousemove "${ROW% *}" "${ROW#* }" click 1; sleep 4
+    else
+        echo "warning: $CL_REPLAY row not found on $d (list: $(python3 "$ROOT/tools/ocr_text.py" "/tmp/opencode/tc-$d.png" 300 140 420 300 6 2>/dev/null | tr '\n' ' '))"
+    fi
+    DISPLAY="$d" xdotool mousemove 887 558 click 1; sleep 6
 done
 sleep "$POST"
 
@@ -128,4 +163,27 @@ if [[ -n "$A_TAKEOVER" && "$A_TAKEOVER" != "$B_TAKEOVER" ]]; then
     echo "INCONCLUSIVE: the clients started different games ('$A_TAKEOVER' vs '$B_TAKEOVER');"
     echo "  fix the replay/map selection (the menu loads Maps/replays/LastReplay.rep)."
     exit 2
+fi
+# A replay with a computer player cannot be driven: aise keeps its state outside the
+# engine snapshot, so the live client refuses to drive and passes frames through (no
+# channel traffic). That is the expected verdict for an AI replay, not a netcode failure.
+if grep -q "computer player present" "$A_LOG" "$B_LOG" 2>/dev/null && [[ -z "${ALLOW_AI:-}" ]]; then
+    echo "INCONCLUSIVE: the replay has a computer player (live client passes frames through by design);"
+    echo "  replace Maps/replays/LastReplay.rep with a human-vs-human replay and re-run."
+    exit 2
+fi
+# With ALLOW_AI=1 the clients drive an AI replay anyway: the transport, prediction and
+# rollback machinery are all exercised, and the hash adjudication is proven by the
+# expected DESYNC verdicts (aise state is not snapshotted, so the sims diverge).
+if [[ -n "${ALLOW_AI:-}" ]]; then
+    A_DESYNC=$(grep -c "live DESYNC" "$A_LOG" 2>/dev/null); B_DESYNC=$(grep -c "live DESYNC" "$B_LOG" 2>/dev/null)
+    A_ROLLS=$(grep -c "live rollback #" "$A_LOG" 2>/dev/null)
+    A_HASH=$(grep -c "reported hash" "$A_LOG" 2>/dev/null)
+    if [[ "$A_DESYNC" -ge 1 || "$B_DESYNC" -ge 1 ]] && [[ "$A_ROLLS" -ge 1 ]] && [[ "$A_HASH" -ge 1 ]]; then
+        echo "PASS-TRANSPORT: rollback turns flowed, prediction rolled back, hashes were reported and the"
+        echo "  expected AI divergence was adjudicated (desyncs: A=$A_DESYNC B=$B_DESYNC)."
+        exit 0
+    fi
+    echo "FAIL: ALLOW_AI run did not show the expected traffic/rollback/adjudication."
+    exit 1
 fi

@@ -20,16 +20,24 @@
 //! The engine applies turns itself at the network step (`0x00486F50` → `ProcessCommands`),
 //! including the local one, and sends the local turn to CrownLink. A rollback client applies
 //! *every* slot's turn for *every* step (including re-simulated ones) through its own input
-//! table, so both would double-apply. `install` therefore NOPs the lockstep send inside the
-//! turn-pipeline fill and no-ops the turn processor, and the turn scheduler is forced ready so
-//! the frame is never skipped for a missing peer turn. Everything is behind
-//! `CM_ROLLBACK_LIVE`, so the default path is untouched.
+//! table, so both would double-apply. `install` therefore no-ops the turn processor, and the
+//! turn-pipeline fill zeroes the outgoing buffer so only the engine's empty-turn marker
+//! travels the lockstep stream; the real commands travel on the rollback channel and are
+//! injected by the client (`ProcessCommands`) — the **only** applier of turns in a live
+//! match. The turn scheduler is forced ready so the frame is never skipped for a missing
+//! peer turn. Everything is behind `CM_ROLLBACK_LIVE`, so the default path is untouched.
+//!
+//! The match's start turns ("start game" + per-player init) are applied by the engine
+//! itself *before* the client takes over (`g_is_in_game` flips after init), so the first
+//! two live steps skip injection (`skip_start`, `CM_ROLLBACK_SKIP_START_TURNS`) — injecting
+//! them again replays init on an initialised world and crashes inside `ProcessCommands`.
 //!
 //! ## What is not validated
 //!
 //! A replay harness has no peer (`CrownLink::connect()` returns `None`, and the engine's turn
 //! path is inert), so this exercises the single-slot path only. Real turns, prediction and
-//! rollback need two clients in a live match.
+//! rollback need two clients in a live match — `tools/two_client_test.sh` (UDP, one machine)
+//! and `tools/crownlink_match.sh` (the real channel) drive exactly that.
 
 #![allow(dead_code)]
 
@@ -54,6 +62,24 @@ pub fn enabled() -> bool {
     std::env::var("CM_ROLLBACK_LIVE").is_ok()
 }
 
+/// Set when the live client has fallen back to normal lockstep (the peer never spoke
+/// the channel, so the other player is not running the plugin). While set, the engine's
+/// own turn path is left intact so the fallback match still plays: the turn processor is
+/// not no-op'd, the turn-pipeline fill does not zero the outgoing buffer, and the turn
+/// scheduler is not forced ready.
+static FALLBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the live client has fallen back to normal lockstep.
+pub fn fallen_back() -> bool {
+    FALLBACK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Arm (or disarm) the lockstep fallback. Cleared when the client stops driving, so a
+/// subsequent match starts fresh.
+pub(crate) fn set_fallback(on: bool) {
+    FALLBACK.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Suppress the engine's own turn path so it applies no turns at all.
 ///
 /// Called from `frame_hook::install` with the exe patcher. Each patch verifies the bytes it
@@ -75,10 +101,12 @@ pub fn install(exe: &mut whack::ModulePatcher) {
     // loop (`0x004D9A4A`) fills the turn pipeline until `step_network` reports ready.
     unsafe {
         exe.hook_closure(ProcessTurns, move |orig: unsafe extern "C" fn() -> u32| -> u32 {
-            // Only once the match is running. In the lobby the engine's own turn processing
-            // carries the lobby state and the map distribution; no-oping it there leaves the
-            // joiner with an empty slot list and the match never starts.
-            if !in_game() {
+            // Only once the match is running, and only while the client is driving. In
+            // the lobby the engine's own turn processing carries the lobby state and the
+            // map distribution; no-oping it there leaves the joiner with an empty slot
+            // list and the match never starts. After a lockstep fallback the engine must
+            // apply its own turns again or the fallback match plays on empty input.
+            if !in_game() || fallen_back() {
                 return orig();
             }
             0
@@ -121,6 +149,10 @@ pub struct Live {
     /// The transport: CrownLink's channel when the loaded `.snp` carries it, a UDP socket
     /// when `CM_ROLLBACK_UDP` names one, or `None` in a replay harness.
     link: Option<Box<dyn Link + Send>>,
+    /// Whether the link is the CrownLink channel, resolved lazily at match takeover
+    /// (storm loads the `.snp` only when the lobby binds the provider, long after plugin
+    /// startup — see `ensure_link`).
+    want_crownlink: bool,
     /// The host's hash adjudicator (`None` on a guest).
     authority: Option<Authority>,
     ranges: &'static RangeList,
@@ -167,8 +199,10 @@ pub struct Live {
     /// Set when the peer never spoke the channel: the other player is not running the plugin,
     /// so the client falls back to normal lockstep instead of stalling the match.
     no_peer: bool,
-    /// Whether the client injects turns itself. False for CrownLink (the engine applies the
-    /// turns it receives); true for the harness carriers.
+    /// Whether the client injects turns itself. Always true while driving: the engine's
+    /// turn processor is no-op'd in live mode and the rollback channel never enters the
+    /// engine's lockstep queue, so the client is the only applier of turns on every
+    /// carrier. `CM_ROLLBACK_NO_INJECT=1` forces it off (diagnostic).
     inject: bool,
     /// Rollbacks performed, and steps run.
     rolls: u32,
@@ -180,6 +214,9 @@ pub struct Live {
     agreements: u32,
     /// Whether the game has started (before that the frame is passed straight through).
     started: bool,
+    /// Whether the no-transport refusal has been logged (it would otherwise spam once
+    /// per frame while the `.snp` loads).
+    refused_logged: bool,
     /// The newest confirmed frame whose hash we have sent.
     hash_reported: u32,
     /// Report a desync hash every this many confirmed frames (ADR-0001 §1.1 says 8; a smaller
@@ -192,12 +229,53 @@ pub struct Live {
 /// `g_is_in_game` (`BW/bwdata.h`): 0 in the menus, 1 once the match is running.
 pub(crate) const G_IS_IN_GAME: usize = 0x006D_5BC8;
 
-/// `first_ai_script` (`AiScriptArray`, `bwdata.h`): non-zero while an AI script is running.
-/// The shadow gate's remaining divergences are AI state (`ai_script_pool`, `ai_town_pool`),
-/// because aise's own globals are not part of the engine snapshot — so a match with an AI
-/// player cannot be rolled back correctly. Detecting it here lets the client stay out of the
-/// way instead of desyncing.
-const FIRST_AI_SCRIPT: usize = 0x0068_C100;
+/// The players array (`bwdata.h`): 8 × `Player` (0x24 bytes), `Player.player_type` at
+/// +0x08 (`bw_dat::structs::Player`; `PlayerType::Computer = 1`, `Human = 2`).
+const PLAYERS: usize = 0x0057_EEE0;
+const PLAYER_STRIDE: usize = 0x24;
+const PLAYER_TYPE_OFF: usize = 0x08;
+const PLAYER_TYPE_COMPUTER: u8 = 1;
+
+/// Whether any game slot is a computer player. This is the precise test: the earlier
+/// `first_ai_script != 0` signal is also set by neutral critters and mod script units,
+/// which would wrongly refuse to drive every ordinary human game. A computer player
+/// cannot be rolled back (aise keeps its state outside the engine snapshot, and its
+/// decisions diverge on a re-simulation), so such a match passes frames through.
+fn computer_player_present() -> bool {
+    let mut types = [0u8; 8];
+    let mut any = false;
+    for i in 0..8usize {
+        let ty = unsafe { *((PLAYERS + i * PLAYER_STRIDE + PLAYER_TYPE_OFF) as *const u8) };
+        types[i] = ty;
+        if ty == PLAYER_TYPE_COMPUTER {
+            any = true;
+        }
+    }
+    // Diagnostic: dump the first four players' records (id, type, race, force, name)
+    // so the slot mapping can be verified against the lobby.
+    unsafe {
+        for i in 0..4usize {
+            let base = (PLAYERS + i * PLAYER_STRIDE) as *const u8;
+            let id = std::ptr::read_unaligned(base as *const u32);
+            let ty = *base.add(0x08);
+            let race = *base.add(0x09);
+            let force = *base.add(0x0A);
+            let name = std::slice::from_raw_parts(base.add(0x0B), 25);
+            let name = name.split(|&b| b == 0).next().unwrap_or(&[]);
+            log(&format!(
+                "[cosmo-rollback] live: player[{i}] id {id} type {ty} race {race} force {force} name {:?}",
+                String::from_utf8_lossy(name)
+            ));
+        }
+    }
+    if any {
+        log(&format!(
+            "[cosmo-rollback] live: player types {:02x?} (computer slot present)",
+            types
+        ));
+    }
+    any
+}
 
 /// Whether the engine is actually in a match (as opposed to a lobby or menu).
 pub(crate) fn in_game() -> bool {
@@ -236,6 +314,11 @@ impl Live {
         );
         // `CM_ROLLBACK_UDP=<local_port>:<peer_port>[:delay_ms]` picks a UDP carrier instead,
         // so two clients can be run on one machine to exercise the transport for real.
+        //
+        // The CrownLink channel is resolved LAZILY (at match takeover), not here: storm
+        // loads `CrownLink.snp` only when the lobby binds the provider, which is long
+        // after plugin startup — resolving at init would always find no module and the
+        // live client would refuse to drive a real match. See `ensure_link` in `tick`.
         let link: Option<Box<dyn Link + Send>> = match std::env::var("CM_ROLLBACK_UDP") {
             Ok(spec) => {
                 let parts: Vec<&str> = spec.split(':').collect();
@@ -265,18 +348,32 @@ impl Live {
                     }
                 }
             }
-            Err(_) => CrownLink::connect().map(|c| Box::new(c) as Box<dyn Link + Send>),
+            // A real match: resolved at takeover (see `ensure_link`).
+            Err(_) => None,
         };
+        let want_crownlink = std::env::var("CM_ROLLBACK_UDP").is_err();
         let inject = link.as_ref().map(|l| l.inject_turns()).unwrap_or(true);
         log(&format!(
             "[cosmo-rollback] live: transport {} — injection {}",
             match &link {
-                Some(_) => if inject { "harness (engine has no turns)" } else { "CrownLink (engine applies turns)" },
+                Some(_) => if inject { "live carrier (client injects every turn)" } else { "CM_ROLLBACK_NO_INJECT (diagnostic)" },
+                None if want_crownlink => "CrownLink channel (resolved at match takeover)",
                 None => "none",
             },
             if inject { "on" } else { "off" }
         ));
         let authority = (local_slot == 0).then(|| Authority::new(2));
+        // The match's start turns ("start game" + per-player init) are applied by the
+        // engine itself before the client takes over, so the first live steps must not
+        // inject them again — that replays init on an initialised world and crashes
+        // inside `ProcessCommands`. A real match (CrownLink carrier) defaults to 2; the
+        // UDP/replay harness has no engine-applied start turns, so its default is 0.
+        // `CM_ROLLBACK_SKIP_START_TURNS` overrides either way.
+        let over_udp = std::env::var("CM_ROLLBACK_UDP").is_ok();
+        let skip_start = std::env::var("CM_ROLLBACK_SKIP_START_TURNS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(if over_udp { 0 } else { 2 });
         // With no peer the harness still needs a second slot for the loop to do anything, so
         // the remote turn is scripted: the no-op on time by default (no misprediction), or
         // `CM_ROLLBACK_SCRIPT_REMOTE` delayed by `CM_ROLLBACK_SCRIPT_DELAY` steps to force
@@ -297,7 +394,7 @@ impl Live {
             .filter(|&n| n > 0)
             .map(Duration::from_secs)
             .unwrap_or(Duration::from_secs(3));
-        if link.is_none() {
+        if link.is_none() && !want_crownlink {
             log(
                 "[cosmo-rollback] live: no transport (replay harness or stock .snp); running \
                  the scripted single-peer path",
@@ -306,6 +403,7 @@ impl Live {
         Self {
             session,
             link,
+            want_crownlink,
             authority,
             ranges: ranges::engine_ranges(),
             ring: Vec::new(),
@@ -325,10 +423,7 @@ impl Live {
             peer_grace,
             peer_seen: false,
             no_peer: false,
-            skip_start: std::env::var("CM_ROLLBACK_SKIP_START_TURNS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
+            skip_start,
             live_steps: 0,
             rolls: 0,
             steps: 0,
@@ -337,6 +432,7 @@ impl Live {
             hashes_sent: 0,
             agreements: 0,
             started: false,
+            refused_logged: false,
             hash_reported: 0,
             hash_every: std::env::var("CM_ROLLBACK_HASH_EVERY")
                 .ok()
@@ -349,6 +445,25 @@ impl Live {
 
     pub fn current(&self) -> u32 {
         self.session.current()
+    }
+
+    /// Resolve the CrownLink channel, once its module is loadable. Called from `tick`:
+    /// storm only loads `CrownLink.snp` when the lobby binds the provider, so resolving
+    /// at plugin startup would always fail. Idempotent: once bound, it stays bound.
+    fn ensure_link(&mut self) {
+        if !self.want_crownlink || self.link.is_some() {
+            return;
+        }
+        match CrownLink::connect() {
+            Some(c) => {
+                log("[cosmo-rollback] live: CrownLink rollback channel bound at takeover");
+                self.link = Some(Box::new(c));
+            }
+            None => {
+                // Not loaded yet (still in the lobby) — or genuinely absent (stock
+                // .snp). Either way the grace logic in `tick` decides the outcome.
+            }
+        }
     }
 
     /// Our own recorded desync hash for `frame`, if we produced it.
@@ -364,33 +479,57 @@ impl Live {
         // from the map init; this harness starts both clients from the same replay's frame 0).
         // Until `g_is_in_game` is set, pass the frame straight through.
         if unsafe { *(G_IS_IN_GAME as *const u32) } == 0 {
+            // A new match starts fresh: a previous match's fallback/AI verdict does not
+            // carry into the next one.
+            if self.started {
+                self.started = false;
+                self.no_peer = false;
+                self.ai_present = false;
+                self.peer_seen = false;
+                self.started_at = None;
+                set_fallback(false);
+            }
             return unsafe { orig(ecx) };
         }
+        // A real match resolves its CrownLink channel now (the .snp was loaded by the
+        // lobby's provider bind) — retried every tick until it succeeds or the grace
+        // logic below falls back to lockstep.
+        self.ensure_link();
         if self.ai_present || self.no_peer {
             return unsafe { orig(ecx) };
         }
         if self.link.is_none() && !self.scripted {
-            if !self.started {
-                self.started = true;
+            if !self.refused_logged {
+                self.refused_logged = true;
                 log(
                     "[cosmo-rollback] live: no transport and no scripted peer \
                      (CM_ROLLBACK_SCRIPT_PEER); passing frames through rather than freezing \
                      on a peer that cannot exist",
                 );
             }
+            // `started` stays false: if the channel resolves on a later tick (the .snp
+            // is still loading), the takeover block still runs its checks.
             return unsafe { orig(ecx) };
         }
         if !self.started {
             self.started = true;
-            // AI players cannot be rolled back: aise keeps its state outside the engine, so a
-            // re-simulation would make different decisions. Refuse to drive rather than desync.
-            if unsafe { *(FIRST_AI_SCRIPT as *const u32) } != 0 {
-                log(
-                    "[cosmo-rollback] live: AI script present — this match has a computer \
-                     player, whose state is not rolled back; passing frames through \
-                     (normal lockstep, no rollback)",
-                );
-                self.ai_present = true;
+            // A computer player cannot be rolled back: aise keeps its state outside the
+            // engine, so a re-simulation would make different decisions. Refuse to drive
+            // rather than desync. `CM_ROLLBACK_ALLOW_AI=1` drives anyway (diagnostic /
+            // farm soak): expect hash divergences while its script runs.
+            if computer_player_present() {
+                if std::env::var("CM_ROLLBACK_ALLOW_AI").is_err() {
+                    log(
+                        "[cosmo-rollback] live: computer player present — its state is not \
+                         rolled back; passing frames through (normal lockstep, no rollback)",
+                    );
+                    self.ai_present = true;
+                } else {
+                    log(
+                        "[cosmo-rollback] live: computer player present but CM_ROLLBACK_ALLOW_AI=1 — \
+                         driving anyway; desync hashes will diverge while the AI runs",
+                    );
+                }
             }
             self.started_at = Some(Instant::now());
             // Farm: once the match has started, free-run the simulation and stop
@@ -489,6 +628,9 @@ impl Live {
                      CrownLink.snp); passing frames through, normal lockstep",
                 );
                 self.no_peer = true;
+                // Give the engine its own turn path back (turn processor + outgoing
+                // buffer + scheduler), or the fallback match would play on empty input.
+                set_fallback(true);
                 return unsafe { orig(ecx) };
             }
         }
@@ -558,8 +700,10 @@ impl Live {
                     self.ticks
                 ));
             }
-            // In a real CrownLink match the engine applies the turns it receives; only the
-            // harness carriers need injection. `CM_ROLLBACK_NO_INJECT=1` forces it off.
+            // The client injects every slot's turn on every carrier: the engine's turn
+            // processor is no-op'd and the rollback channel never enters the engine's
+            // lockstep queue, so this is the only applier of turns in a live match.
+            // `CM_ROLLBACK_NO_INJECT=1` forces it off (diagnostic).
             let no_inject = std::env::var("CM_ROLLBACK_NO_INJECT").is_ok();
             let skip_inject = no_inject || !self.inject || self.live_steps < self.skip_start;
             self.live_steps += 1;

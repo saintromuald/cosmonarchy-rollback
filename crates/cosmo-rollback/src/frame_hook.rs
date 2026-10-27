@@ -214,8 +214,9 @@ fn trace(ticks_in: u32, stalled: u8, r: u32, forced: bool) {
 /// Whether `CM_ROLLBACK_FORCE_TURN` asks for one turn per frame with no stalling.
 fn force_turn() -> bool {
     // The live client must never let the engine skip a frame for a missing peer turn: it
-    // supplies every turn itself.
-    std::env::var("CM_ROLLBACK_FORCE_TURN").is_ok() || crate::rollback::live::enabled()
+    // supplies every turn itself. After a lockstep fallback the engine paces itself again.
+    std::env::var("CM_ROLLBACK_FORCE_TURN").is_ok()
+        || (crate::rollback::live::enabled() && !crate::rollback::live::fallen_back())
 }
 
 /// Runs the outer main loop's post-frame update (`0x004D93F0`) once.
