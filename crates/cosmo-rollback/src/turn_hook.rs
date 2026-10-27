@@ -124,8 +124,12 @@ pub fn install(exe: &mut whack::ModulePatcher) {
                     // working (see `rollback/live.rs`).
                     // Only in a match: zeroing the buffer in the lobby would also discard the
                     // lobby's own turn payloads (the engine sends the map/lobby state over the
-                    // same turns), and the joiner would never receive the map.
-                    if crate::rollback::live::enabled() && crate::rollback::live::in_game() {
+                    // same turns), and the joiner would never receive the map. After a
+                    // lockstep fallback the engine's own turns flow again untouched.
+                    if crate::rollback::live::enabled()
+                        && crate::rollback::live::in_game()
+                        && !crate::rollback::live::fallen_back()
+                    {
                         *(G_COMMAND_QUEUE_SIZE as *mut u32) = 0;
                     }
                     orig()

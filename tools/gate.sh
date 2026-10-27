@@ -23,10 +23,17 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="${1:-Release}"
 DEPTH="${2:-3}"
 START="${3:-90}"
-CLICKS="${CM_GATE_CLICKS:-490,182;940,590;320,645;350,238;940,590}"
+# A fresh boot can land on the profile chooser (trees used by the CrownLink harness
+# carry several profiles); Enter picks the highlighted one and proceeds to the main
+# menu, after which the fixed clicks apply.
+CLICKS="${CM_GATE_CLICKS:-key:Return;490,182;940,590;320,645;350,238;940,590}"
 BOOT="${CM_GATE_BOOT:-55}"
 POST="${CM_GATE_POST:-60}"
-LOG="$HOME/Games/cosmonarchy/prefix/drive_c/Cosmonarchy/$BUILD/cosmo_rollback.log"
+# Isolated game trees (the two-client sandboxes) have their own Release build; the
+# main tree's builds live under the launcher's layout now, so the gate must follow
+# COSMO_GAME_ROOT like headless_probe.sh does.
+GAME_ROOT="${COSMO_GAME_ROOT:-$HOME/Games/cosmonarchy}"
+LOG="$GAME_ROOT/prefix/drive_c/Cosmonarchy/$BUILD/cosmo_rollback.log"
 
 "$ROOT/tools/build.sh"
 "$ROOT/tools/install-plugin.sh" "$BUILD"
