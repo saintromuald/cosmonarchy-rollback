@@ -637,6 +637,8 @@ impl Live {
             Err(e) => format!("MISMATCH (read: {e})"),
         };
         log(&format!("[cosmo-rollback] saveverify f{frame}: {verdict}"));
+    }
+
     /// Reset everything that belongs to one match, called when the game leaves the match
     /// (the `g_is_in_game` falling edge). A rematch runs in the same process, and the
     /// session's frame numbers, input table and confirmed frontier, the snapshot ring
@@ -672,7 +674,6 @@ impl Live {
         self.script_issued = 0;
         self.ticks = 0;
         set_driving(false);
->>>>>>> origin/master
     }
 
     /// One game frame. `orig` is the engine's frame function through the trampoline; it is
