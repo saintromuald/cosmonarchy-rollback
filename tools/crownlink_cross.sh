@@ -36,6 +36,12 @@ JOIN_S=b
 
 die() { echo "cross: $*" >&2; exit 1; }
 
+# Tildes in the peer paths are expanded locally (the remote shell never sees a quoted
+# `~`, which would stay literal): the peer home is resolved once, up front.
+PEER_HOME="$(ssh "$PEER" 'echo "$HOME"')"
+PEER_ROOT="${PEER_ROOT/#\~/$PEER_HOME}"
+PEER_REPO="${PEER_REPO/#\~/$PEER_HOME}"
+
 # Clean slate on both machines.
 pkill -9 -f 'Cosmonarchy BW\.exe$' 2>/dev/null
 pkill -9 -f 'Xvfb :96 -screen' 2>/dev/null
@@ -46,20 +52,20 @@ echo "cross: host on $HOST_S (:96, $LOCAL_ROOT), joiner on $PEER ($JOIN_S, $PEER
 
 # The host creates the lobby first (its creation tears down if the joiner restarts, and
 # the joiner needs a game to find).
-${DELAY:+CL_SEND_DELAY_MS=$DELAY} "$M" host "$HOST_S" :96 "$LOCAL_ROOT" 0
+CL_SEND_DELAY_MS=$DELAY "$M" host "$HOST_S" :96 "$LOCAL_ROOT" 0
 HOST_RC=$?
 echo "cross: host steps done (rc $HOST_RC)"
 [[ $HOST_RC -eq 0 ]] || die "host steps failed"
 
 # The joiner (on the peer) boots and joins the lobby.
-ssh "$PEER" "cd '$PEER_REPO' && CL_PASSWORD='${CL_PASSWORD:-rollback-test}' \
-  ${DELAY:+CL_SEND_DELAY_MS=$DELAY} ./tools/crownlink_match.sh join '$JOIN_S' :96 '$PEER_ROOT' 1 alpha"
+ssh "$PEER" "cd \"$PEER_REPO\" && CL_PASSWORD='${CL_PASSWORD:-rollback-test}' \
+  CL_SEND_DELAY_MS=$DELAY ./tools/crownlink_match.sh join '$JOIN_S' :96 '$PEER_ROOT' 1 alpha"
 JOIN_RC=$?
 echo "cross: join steps done (rc $JOIN_RC)"
 [[ $JOIN_RC -eq 0 ]] || die "join steps failed"
 
 # Both in the lobby: the host starts the match.
-DISPLAY=:96 xdotool mousemove 931 589 click 1
+DISPLAY=:96 xdotool mousemove 902 564 click 1
 echo "cross: match started; soaking ${SOAK}s"
 sleep 45
 DISPLAY=:96 import -window root /tmp/opencode/cross-host-ingame.png 2>/dev/null || true
@@ -76,7 +82,7 @@ echo "== host log =="
 
 # Teardown.
 "$UI" stop "$HOST_S" >/dev/null 2>&1 || true
-ssh "$PEER" "cd '$PEER_REPO' && tools/ui_session.sh stop '$JOIN_S' >/dev/null 2>&1; pkill -9 -f 'Cosmonarchy BW\.exe$' 2>/dev/null; pkill -9 -f 'Xvfb :96 -screen' 2>/dev/null; true"
+ssh "$PEER" "cd \"$PEER_REPO\" && tools/ui_session.sh stop '$JOIN_S' >/dev/null 2>&1; pkill -9 -f 'Cosmonarchy BW\.exe$' 2>/dev/null; pkill -9 -f 'Xvfb :96 -screen' 2>/dev/null; true"
 pkill -9 -f 'Cosmonarchy BW\.exe$' 2>/dev/null
 pkill -9 -f 'Xvfb :96 -screen' 2>/dev/null
 echo "cross: done"

@@ -178,18 +178,20 @@ host_steps() { # session
 join_steps() { # session game
     local s="$1" want="${2:-alpha}" title="" attempt xy x y
     open_multiplayer "$s" "${CL_JOIN_PROFILE:-beta}"
+    # The host's game carries the shared lobby password, and the public games list
+    # only shows games matching the viewer's own filter: set the same password or the
+    # list stays empty. The filter row sits at the bottom of the games screen
+    # (Password / Set / Clear).
+    click "$s" 585 660 4    # Set
+    "$S" type "$s" "${CL_PASSWORD:-rollback-test}"
+    "$S" key "$s" Return
+    sleep 3
     shot "$s" games
-    for attempt in 1 2 3 4 5; do
-        xy="$(pick_row "$s" "$want")" || { sleep 3; continue; }
-        read -r x y <<<"$xy"
-        onscreen "$s" xdotool mousemove "$x" "$y" click 1
-        shot "$s" "select-$attempt"
-        title="$(python3 "$ROOT/tools/ocr_text.py" "$(state "$s")/select-$attempt.png" 840 110 200 30 7)"
-        echo "  attempt $attempt: clicked ($x,$y), title reads '$title'"
-        [[ "${title,,}" == *"${want,,}"* ]] && break
-        sleep 2
-    done
-    [[ "${title,,}" == *"${want,,}"* ]] || die "could not select '$want' (last title '$title')"
+    # The password filter leaves exactly one game in the list: take the first row
+    # (its title is the host's player name, which is whatever profile the host picked,
+    # so matching by name is not reliable).
+    click "$s" 400 174 3
+    shot "$s" "select"
     click "$s" 900 559 12    # Ok -> join
     shot "$s" joined
 }
