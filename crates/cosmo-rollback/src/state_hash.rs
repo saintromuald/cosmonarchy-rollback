@@ -133,14 +133,11 @@ const POINTER_FREE: &[&str] = &[
     "order_timer_reset",
     "secondary_order_timer_reset",
     "unit_ordering_count",
-    "interceptor_focused_this_frame",
-    "interceptor_focused_next",
     "larva_counter",
     "draw_cursor_marker",
     "current_visibility_hash",
     "want_visibility_hash_update",
     "region_vision_hash",
-    "current_hash_offset",
     "trig_remove_unit_active",
     "trig_killing_additional_unit",
     "trig_kill_unit_count",
@@ -148,19 +145,22 @@ const POINTER_FREE: &[&str] = &[
     // are deliberately not listed: they are harness-specific input, not simulation state
     // (ADR-0005), so two clients in a replay sit at different cursors and hashing them reports
     // a desync that is not one. In a live match they are inert.
-    "lakiz_splash_list_index",
-    "mask_hash_current_x",
-    "mask_hash_current_y",
-    "mask_hash_next",
-    // Probe-derived scalars (see `ranges.rs`); they step like counters. Verified by
-    // their use sites (see `docs/analysis/ranges-additions.md` §6): `57eebc` is a turn
-    // counter (`inc` per network step), `59cc8c`/`69556c` are countdowns, `68fee4`/
-    // `6aa04c` are round-robin cursors 0..7 — all values, safe across processes.
-    "probe_57eebc",
-    "probe_59cc8c",
-    "probe_68fee4",
-    "probe_69556c",
-    "probe_6aa04c",
+    //
+    // The following are deliberately NOT compared for the same reason as `sprite_count`:
+    // a rollback re-sim reproduces the *simulation* (the unit/order/bullet/rng state all
+    // matched in the two-machine run's fingerprint diff) but not the engine's
+    // transport/draw scratch, which is recomputed on wall-clock cadences:
+    //   `interceptor_focused_*` — the interceptor draw focus (per-frame scratch)
+    //   `lakiz_splash_list_index` — the gptp splash effect scratch
+    //   `mask_hash_*`          — the fog-of-war sync hashes (recomputed by the vision pass)
+    //   `current_hash_offset`  — the engine's 0x37 sync-hash pipeline offset (transport)
+    //   `probe_57eebc`         — the per-network-step turn counter (the re-sim does not
+    //                            run the network cadence, so it cannot match post-rollback)
+    //   `probe_59cc8c`/`69556c`/`68fee4`/`6aa04c` — cadence counters the re-sim likewise
+    //                            does not reproduce (see ranges.rs §6)
+    //
+    // The two-machine run desynced at frame 8 with exactly these ranges diverged while
+    // every simulation range matched; comparing them reports a desync that is not one.
     // `probe_65fae4` is deliberately NOT here: it is written through a computed address
     // (it has no direct reference in the exe) and whether its bytes are values or
     // addresses is unproven, so including it risks a false desync on every frame. A

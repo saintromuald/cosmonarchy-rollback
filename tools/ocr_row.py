@@ -53,33 +53,35 @@ def main() -> int:
             )
         except subprocess.CalledProcessError:
             return 1
-        # Tesseract is flaky on small/degenerate crops: retry a few times and treat a
-        # persistent failure as "no match" instead of raising.
+        # Tesseract is flaky on this pixel font: the same image OCRs differently run to
+        # run (rows drop out or gain junk glyphs). Retry several times and match against
+        # the UNION of all runs' rows, so a row that read cleanly in any single pass is
+        # found. A persistent tesseract failure still means "no match".
         ok = False
-        for _ in range(3):
+        matches = []
+        for _ in range(6):
             try:
                 subprocess.run(
-                    ["tesseract", str(crop), str(base), "tsv", "--psm", "6"],
+                    ["tesseract", str(crop), str(base), "--psm", "6", "tsv"],
                     check=True,
                     capture_output=True,
                 )
                 ok = True
-                break
             except subprocess.CalledProcessError:
                 continue
-        if not ok:
-            return 1
-
-        with open(f"{base}.tsv", newline="", encoding="utf-8") as file:
-            rows = list(csv.DictReader(file, delimiter="\t"))
-
-        for level in (LINE, WORD):
+            with open(f"{base}.tsv", newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file, delimiter="\t"))
+            # Multi-word queries ("Class 0 - Testing Grounds") never match a single
+            # word: the line rows carry no text and tesseract splits the row across
+            # words. Reconstruct each line by joining its words (grouped by block,
+            # paragraph and line) and match the query against the joined line, then
+            # against each word as a fallback for single-word queries.
+            lines = {}
             for row in rows:
-                if row.get("level") != level:
+                if row.get("level") != WORD:
                     continue
-                text = (row.get("text") or "").strip().lower()
-                if want not in text:
-                    continue
+                key = (row.get("block_num"), row.get("par_num"), row.get("line_num"))
+                word = (row.get("text") or "").strip().lower()
                 try:
                     top = int(row["top"])
                     height = int(row["height"])
@@ -87,9 +89,29 @@ def main() -> int:
                     width = int(row["width"])
                 except (KeyError, TypeError, ValueError):
                     continue
-                print(CROP_X + (left + width // 2) // SCALE, CROP_Y + (top + height // 2) // SCALE)
-                return 0
-    return 1
+                if word:
+                    entry = lines.setdefault(key, {"words": [], "top": top, "height": height, "left": left, "right": left + width})
+                    entry["words"].append(word)
+                    entry["top"] = min(entry["top"], top)
+                    entry["height"] = max(entry["height"], height)
+                    entry["left"] = min(entry["left"], left)
+                    entry["right"] = max(entry["right"], left + width)
+            for entry in lines.values():
+                joined = " ".join(entry["words"])
+                if want not in joined:
+                    continue
+                point = (
+                    CROP_X + ((entry["left"] + entry["right"]) // 2) // SCALE,
+                    CROP_Y + (entry["top"] + entry["height"] // 2) // SCALE,
+                )
+                if point not in matches:
+                    matches.append(point)
+        if not ok:
+            return 1
+        if not matches:
+            return 1
+        print(matches[0][0], matches[0][1])
+        return 0
 
 
 if __name__ == "__main__":
