@@ -118,12 +118,14 @@ const POINTER_FREE: &[&str] = &[
     // Engine scalars, counters and timers.
     "rng_seed",
     "rng_enabled",
-    "frame_cooldown",
     "is_paused",
-    "vision_updated",
     "turn_stalled",
-    "turn_ticks_left",
     "unit_count",
+    // `frame_cooldown`, `turn_ticks_left` and `vision_updated` are deliberately NOT
+    // compared: they count wall-clock frame/turn pacing and the vision pass, which a
+    // rollback re-sim runs back-to-back instead of wall-paced, so they cannot match
+    // post-rollback (the two-machine run's second fingerprint diff showed exactly
+    // these diverged while every simulation range matched).
     // `sprite_count` is deliberately **not** compared: the draw pass allocates and frees
     // high-index *helper* sprites outside the frame (see `pools.rs` `SPRITE_SIM`), so the count
     // is outer-written and wall-clock dependent. Two clients a frame out of phase on it were
@@ -141,6 +143,9 @@ const POINTER_FREE: &[&str] = &[
     "trig_remove_unit_active",
     "trig_killing_additional_unit",
     "trig_kill_unit_count",
+    // The trigger *timers* are NOT compared: they tick on the frame pacing, which the
+    // re-sim does not reproduce (same class as `frame_cooldown`; the trigger flags and
+    // counters above are compared and matched in the two-machine run).
     // The replay cursors (`next_replay_command_frame`, `replay_end_frame`, `replay_cmd_count`)
     // are deliberately not listed: they are harness-specific input, not simulation state
     // (ADR-0005), so two clients in a replay sit at different cursors and hashing them reports
@@ -165,9 +170,10 @@ const POINTER_FREE: &[&str] = &[
     // (it has no direct reference in the exe) and whether its bytes are values or
     // addresses is unproven, so including it risks a false desync on every frame. A
     // missing name costs coverage, never a false desync.
-    // Trigger per-frame timers and per-player trigger state (flags and timers).
-    "trigger_execution_timer",
-    "trigger_elapsed_time_tick_timer",
+    // Trigger per-frame timers are NOT compared (they tick on the frame pacing the
+    // rollback re-sim does not reproduce — the two-machine run showed exactly these two
+    // diverged while every simulation range matched); the per-player trigger flags,
+    // wait timers and the current-trigger state below ARE compared (they matched).
     "player_trigger_wait_timers",
     "player_trigger_wait_active_flags",
     "current_trigger_player",
