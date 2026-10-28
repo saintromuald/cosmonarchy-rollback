@@ -46,7 +46,7 @@ if [ "$CX" != "none" ]; then
         # Plain `x,y` stays a single click, exactly as before.
         if [[ "$c" == key:* ]]; then
             DISPLAY="$DISPLAY_NUM" xdotool key "${c#key:}"
-            sleep 2
+            sleep 5
             continue
         fi
         x="${c%%,*}"
@@ -59,6 +59,7 @@ if [ "$CX" != "none" ]; then
         else
             DISPLAY="$DISPLAY_NUM" xdotool mousemove "$x" "$y" click 1
         fi
+
         sleep 5
     done
 fi

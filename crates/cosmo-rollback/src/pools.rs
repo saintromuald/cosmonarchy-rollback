@@ -338,11 +338,14 @@ pub fn add_plugin_state_ranges(rl: &mut RangeList) {
 
 /// Add every resolved pool and relocated array as a snapshot range.
 pub fn add_ranges(rl: &mut RangeList) {
+    log("[cosmo-rollback] ranges: add_ranges enter");
     if std::env::var("CM_ROLLBACK_NO_POOLS").is_ok() {
         log("[cosmo-rollback] CM_ROLLBACK_NO_POOLS: object pools excluded from snapshot");
         return;
     }
+    log("[cosmo-rollback] ranges: resolving pools");
     let p = get();
+    log("[cosmo-rollback] ranges: pools resolved");
     // The unit, sprite and image pools are snapshotted field-by-field (see the
     // `*_SIM` specs below) so the render/scratch fields the outer main loop's draw
     // pass (`0x0041CA00` H_RenderScreen) rewrites *between* two logic frames are not
@@ -365,6 +368,7 @@ pub fn add_ranges(rl: &mut RangeList) {
         if raw || fields.is_empty() {
             rl.add(RangeSpec::new(name, addr, len));
         } else {
+            log(&format!("[cosmo-rollback] ranges: building {name} field ranges ({count} x {fields:?})"));
             let label: &'static str = Box::leak(format!("{name}.sim").into_boxed_str());
             let render_label: &'static str =
                 Box::leak(format!("{name}.render").into_boxed_str());
@@ -380,6 +384,7 @@ pub fn add_ranges(rl: &mut RangeList) {
                     rl.add(RangeSpec::new(render_label, addr + i * stride + off, flen));
                 }
             }
+            log(&format!("[cosmo-rollback] ranges: built {name} field ranges"));
         }
     }
     // The UnitPath pool. It is **heap-allocated** at game init (`0x0042F4F0`:

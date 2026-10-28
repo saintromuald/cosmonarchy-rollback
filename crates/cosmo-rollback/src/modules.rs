@@ -64,36 +64,63 @@ pub fn range_committed(addr: usize, len: usize) -> bool {
 const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 const IMAGE_SCN_MEM_SHARED: u32 = 0x1000_0000;
 
+/// The loaded module list `(name, base, size)`, captured **once**.
+///
+/// `CreateToolhelp32Snapshot(TH32CS_SNAPMODULE)` takes the loader lock. Calling it on
+/// the game thread while the engine holds that lock (loading a temp MPQ at the first
+/// frame) deadlocks the game — the first-frame ranges build froze the game exactly
+/// this way: the menu rendered once, then the frame hook never returned. The module
+/// list does not change after plugin startup (the pools live in `gptp.qdp` and the
+/// exe, both loaded by then), so the snapshot is taken once at load time and every
+/// later lookup walks the cache.
+static MODULES: once_cell::sync::OnceCell<Vec<(String, usize, usize)>> =
+    once_cell::sync::OnceCell::new();
+
+/// The cached module list. Warm it from `audit::on_start` (load time); every other
+/// caller uses the cache and never takes the loader lock.
+pub(crate) fn module_list() -> &'static [(String, usize, usize)] {
+    MODULES.get_or_init(|| {
+        let mut out = Vec::new();
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return out;
+            }
+            let mut me: MODULEENTRY32 = zeroed();
+            me.dwSize = std::mem::size_of::<MODULEENTRY32>() as u32;
+            if Module32First(snap, &mut me) != 0 {
+                loop {
+                    out.push((
+                        cstr(std::slice::from_raw_parts(
+                            me.szModule.as_ptr() as *const u8,
+                            me.szModule.len(),
+                        )),
+                        me.modBaseAddr as usize,
+                        me.modBaseSize as usize,
+                    ));
+                    if Module32Next(snap, &mut me) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snap);
+        }
+        out
+    })
+}
+
 /// Writable, non-shared sections of every loaded `.qdp` plugin (ours excluded), up to
 /// `max_len` bytes each. The reproducibility probe passes `usize::MAX` so it can *read*
 /// gptp's ~19 MB `.data` even though that is never snapshotted.
 pub fn writable_sections(max_len: usize) -> Vec<RangeSpec> {
     let mut out = Vec::new();
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, 0);
-        if snap == INVALID_HANDLE_VALUE {
-            return out;
+    for (name, base, _size) in module_list() {
+        let lname = name.to_ascii_lowercase();
+        // Skip our own module: its `.data` holds the rollback engine itself
+        // (ring, mutex); restoring it mid-step would corrupt us.
+        if lname.ends_with(".qdp") && !lname.contains("cosmo-rollback") {
+            unsafe { add_writable_sections(*base, name, max_len, &mut out) };
         }
-        let mut me: MODULEENTRY32 = zeroed();
-        me.dwSize = std::mem::size_of::<MODULEENTRY32>() as u32;
-        if Module32First(snap, &mut me) != 0 {
-            loop {
-                let name = cstr(std::slice::from_raw_parts(
-                    me.szModule.as_ptr() as *const u8,
-                    me.szModule.len(),
-                ));
-                let lname = name.to_ascii_lowercase();
-                // Skip our own module: its `.data` holds the rollback engine itself
-                // (ring, mutex); restoring it mid-step would corrupt us.
-                if lname.ends_with(".qdp") && !lname.contains("cosmo-rollback") {
-                    add_writable_sections(me.modBaseAddr as usize, &name, max_len, &mut out);
-                }
-                if Module32Next(snap, &mut me) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snap);
     }
     out
 }
@@ -108,33 +135,12 @@ pub fn owner_of(addr: usize, len: usize) -> Option<String> {
         return None;
     }
     let end = addr.checked_add(len)?;
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, 0);
-        if snap == INVALID_HANDLE_VALUE {
-            return None;
+    for (name, base, size) in module_list() {
+        if addr >= *base && end <= base.saturating_add(*size) {
+            return Some(name.clone());
         }
-        let mut me: MODULEENTRY32 = zeroed();
-        me.dwSize = std::mem::size_of::<MODULEENTRY32>() as u32;
-        let mut found = None;
-        if Module32First(snap, &mut me) != 0 {
-            loop {
-                let base = me.modBaseAddr as usize;
-                let size = me.modBaseSize as usize;
-                if addr >= base && end <= base.saturating_add(size) {
-                    found = Some(cstr(std::slice::from_raw_parts(
-                        me.szModule.as_ptr() as *const u8,
-                        me.szModule.len(),
-                    )));
-                    break;
-                }
-                if Module32Next(snap, &mut me) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snap);
-        found
     }
+    None
 }
 
 /// Writable, non-shared sections of every loaded `.qdp` plugin, bounded to 1 MB each:
@@ -151,32 +157,12 @@ pub fn plugin_ranges() -> Vec<RangeSpec> {
 /// because the `.qdp` modules are relocated per process (the resolved pool bases differ
 /// between runs).
 pub fn section_base(name: &str) -> Option<usize> {
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, 0);
-        if snap == INVALID_HANDLE_VALUE {
-            return None;
+    for (modname, base, _size) in module_list() {
+        if let Some(b) = unsafe { section_base_in(*base, modname, name) } {
+            return Some(b);
         }
-        let mut me: MODULEENTRY32 = zeroed();
-        me.dwSize = std::mem::size_of::<MODULEENTRY32>() as u32;
-        let mut found = None;
-        if Module32First(snap, &mut me) != 0 {
-            loop {
-                let modname = cstr(std::slice::from_raw_parts(
-                    me.szModule.as_ptr() as *const u8,
-                    me.szModule.len(),
-                ));
-                if let Some(b) = section_base_in(me.modBaseAddr as usize, &modname, name) {
-                    found = Some(b);
-                    break;
-                }
-                if Module32Next(snap, &mut me) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snap);
-        found
     }
+    None
 }
 
 /// Walk one loaded module's section table for the writable section named
@@ -223,32 +209,14 @@ pub fn log_modules() {
 /// Log only the loaded modules whose name contains any of `needles` (case-insensitive).
 /// An empty `needles` logs every module.
 pub fn log_modules_matching(needles: &[&str]) {
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, 0);
-        if snap == INVALID_HANDLE_VALUE {
-            return;
+    for (name, base, size) in module_list() {
+        let lower = name.to_ascii_lowercase();
+        if needles.is_empty() || needles.iter().any(|n| lower.contains(n)) {
+            crate::log::log(&format!(
+                "[cosmo-rollback]   module {:<24} base 0x{:08x} size 0x{:x}",
+                name, base, size
+            ));
         }
-        let mut me: MODULEENTRY32 = zeroed();
-        me.dwSize = std::mem::size_of::<MODULEENTRY32>() as u32;
-        if Module32First(snap, &mut me) != 0 {
-            loop {
-                let name = cstr(std::slice::from_raw_parts(
-                    me.szModule.as_ptr() as *const u8,
-                    me.szModule.len(),
-                ));
-                let lower = name.to_ascii_lowercase();
-                if needles.is_empty() || needles.iter().any(|n| lower.contains(n)) {
-                    crate::log::log(&format!(
-                        "[cosmo-rollback]   module {:<24} base 0x{:08x} size 0x{:x}",
-                        name, me.modBaseAddr as usize, me.modBaseSize
-                    ));
-                }
-                if Module32Next(snap, &mut me) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snap);
     }
 }
 

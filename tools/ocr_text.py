@@ -36,12 +36,23 @@ def main() -> int:
             check=True,
             capture_output=True,
         )
-        result = subprocess.run(
-            ["tesseract", str(crop), "stdout", "--psm", psm],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        # Tesseract is flaky on small/degenerate crops (SIGFPE on some inputs): retry a
+        # few times and never raise — callers treat empty output as "no match".
+        result = None
+        for _ in range(3):
+            try:
+                result = subprocess.run(
+                    ["tesseract", str(crop), "stdout", "--psm", psm],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                break
+            except subprocess.CalledProcessError:
+                continue
+        if result is None:
+            print("")
+            return 0
         print(" ".join(result.stdout.split()))
     return 0
 
