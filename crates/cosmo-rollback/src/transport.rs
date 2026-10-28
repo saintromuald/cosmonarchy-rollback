@@ -19,8 +19,8 @@ use std::time::Instant;
 /// Bumped when the encoding changes; a peer with a different version is rejected rather
 /// than misparsed. Version 2 added the reporting slot to `Hash` (v1 was ambiguous about
 /// which peer a hash came from) and the authority's `LeadReport`/`TurnsComplete`.
-/// Version 3 added `Arm` (the arming handshake's deterministic flip frame).
-pub const WIRE_VERSION: u8 = 3;
+/// Version 4 added the delta to `Arm` (the announced session fast-forward).
+pub const WIRE_VERSION: u8 = 4;
 
 /// Largest turn blob accepted, to bound allocation from a hostile or corrupt peer. A turn
 /// is a frame's worth of commands; 4 KiB is far above anything the engine produces.
@@ -71,7 +71,14 @@ pub enum Msg {
     /// sessions align deterministically no matter when the messages arrive. Sent by the
     /// host once it has seen the guest's traffic, and re-sent until the flip (it travels
     /// over plain UDP).
-    Arm { frame: u32 },
+    /// The host's arming announcement: the deterministic flip frame and the session
+    /// fast-forward both clients must use. The delta is the host's engine turn count
+    /// since takeover: the two clients' takeover detections can differ by several
+    /// network steps (the replay load completes at slightly different frames), so each
+    /// side's own `turn_count() - takeover_turn` disagrees — the announced delta is the
+    /// single source of truth (a delta of 0 means "not yet known": the host fills it in
+    /// at its flip and re-sends until then).
+    Arm { frame: u32, delta: u32 },
 }
 
 impl Msg {
@@ -81,7 +88,7 @@ impl Msg {
             Msg::Turn { frame, .. } | Msg::Hash { frame, .. } => *frame,
             Msg::Leave { step, .. } => *step,
             Msg::Ack { seq, .. } => *seq,
-            Msg::Arm { frame } => *frame,
+            Msg::Arm { frame, .. } => *frame,
             Msg::LeadReport { .. } | Msg::TurnsComplete { .. } => 0,
         }
     }
@@ -141,9 +148,10 @@ impl Msg {
                 out.push(*slot);
                 out.extend_from_slice(&seq.to_le_bytes());
             }
-            Msg::Arm { frame } => {
+            Msg::Arm { frame, delta } => {
                 out.push(TAG_ARM);
                 out.extend_from_slice(&frame.to_le_bytes());
+                out.extend_from_slice(&delta.to_le_bytes());
             }
         }
         out
@@ -215,7 +223,8 @@ impl Msg {
             }
             TAG_ARM => {
                 let frame = u32::from_le_bytes(take(&mut p, 4)?.try_into().ok()?);
-                Some((Msg::Arm { frame }, p))
+                let delta = u32::from_le_bytes(take(&mut p, 4)?.try_into().ok()?);
+                Some((Msg::Arm { frame, delta }, p))
             }
             _ => None,
         }
@@ -695,7 +704,7 @@ mod tests {
         round_trip(Msg::TurnsComplete {
             counts: [1, 2, 3, 4, 5, 6, 7, 8],
         });
-        round_trip(Msg::Arm { frame: 0x1234_5678 });
+        round_trip(Msg::Arm { frame: 0x1234_5678, delta: 0x0000_0010 });
     }
 
     #[test]

@@ -210,9 +210,18 @@ pub struct Live {
     /// The sim frame at which the client starts driving (the host's `Arm` announcement,
     /// or the host's own choice). `None` while pending.
     arm_frame: Option<u32>,
-    /// The local turn last sent over the channel while pending (dedup: the buffer is
-    /// re-sent only on change).
-    pending_sent: Option<Vec<u8>>,
+    /// The announced session fast-forward (the host computes it at its flip).
+    arm_delta: Option<u32>,
+    /// The last sequence number sent over the channel while pending. The pending turn
+    /// must be sent **once per sequence**, not once per content change: the engine's
+    /// no-op turn ([0x05]) is identical every step, and content-dedup left the peer's
+    /// table with gaps at the flip — the guest's pre-flip turns for the gap steps never
+    /// arrived, the host stalled at the prediction limit forever, and the match froze.
+    pending_last_seq: u32,
+    /// Whether any pending turn has been sent at all, and when the last one went out
+    /// (drives the pending keepalive re-send).
+    pending_sent_any: bool,
+    pending_last_at: Instant,
     /// Whether the client injects turns itself. Always true while driving: the engine's
     /// turn processor is no-op'd in live mode and the rollback channel never enters the
     /// engine's lockstep queue, so the client is the only applier of turns on every
@@ -258,6 +267,11 @@ pub(crate) const G_IS_IN_GAME: usize = 0x006D_5BC8;
 /// the match is handed back to the engine's own turn path. A lost peer would otherwise
 /// stall the simulation forever.
 const PEER_LOSS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How often the pending phase re-sends its last turn as a keepalive, so a slow guest
+/// keeps the host's peer-loss grace from expiring while the guest is still in the
+/// lockstep-pending phase (see `pending_last_at`).
+const PENDING_KEEPALIVE: Duration = Duration::from_secs(2);
 
 /// `Game.frame_count` (`bwdata.h:218`): the simulation frame, identical on both clients.
 const FRAME_COUNT: usize = 0x0057_F23C;
@@ -501,7 +515,10 @@ impl Live {
             no_peer: false,
             takeover_turn: 0,
             arm_frame: None,
-            pending_sent: None,
+            arm_delta: None,
+            pending_last_seq: 0,
+            pending_sent_any: false,
+            pending_last_at: Instant::now(),
             skip_start,
             live_steps: 0,
             rolls: 0,
@@ -575,7 +592,10 @@ impl Live {
         self.last_traffic = None;
         self.takeover_turn = 0;
         self.arm_frame = None;
-        self.pending_sent = None;
+        self.arm_delta = None;
+        self.pending_last_seq = 0;
+        self.pending_sent_any = false;
+        self.pending_last_at = Instant::now();
         self.live_steps = 0;
         self.hash_reported = 0;
         self.desync_logged = None;
@@ -674,14 +694,21 @@ impl Live {
             // Send the local turn so the peer can see we are armed. (The engine's own
             // lockstep stream also carries it; this channel copy is what the handshake
             // keys on, and the flip's `advance_to` drops these pre-flip turns.) The
-            // turn is sent only when its bytes change: the pending phase can last tens
-            // of seconds (a slow peer), and sending the same buffer every tick would
-            // flood the channel for nothing.
+            // turn is sent once per sequence, plus a periodic keepalive re-send of the
+            // last sequence: a slow guest can stay pending for tens of seconds, and
+            // without the keepalive the host's peer-loss grace sees "no traffic" and
+            // hands the match back to lockstep before the guest ever flips.
             let local = strip_sync_markers(crate::turn_hook::local_turn());
-            if self.pending_sent.as_deref() != Some(local.as_slice()) {
-                self.pending_sent = Some(local.clone());
+            let seq = self.session.current();
+            let keepalive = self.pending_sent_any
+                && seq == self.pending_last_seq
+                && self.pending_last_at.elapsed() >= PENDING_KEEPALIVE;
+            if !self.pending_sent_any || seq > self.pending_last_seq || keepalive {
+                self.pending_sent_any = true;
+                self.pending_last_seq = seq;
+                self.pending_last_at = now;
                 if let Some(link) = self.link.as_mut() {
-                    self.session.send_local_turn(link, self.session.current(), local, now);
+                    self.session.send_local_turn(link, seq, local, now);
                 }
             }
             if self.no_peer || self.ai_present {
@@ -695,7 +722,10 @@ impl Live {
                     self.arm_frame = Some(k);
                 }
                 if let (Some(k), Some(link)) = (self.arm_frame, self.link.as_mut()) {
-                    link.send(crate::transport::Msg::Arm { frame: k });
+                    link.send(crate::transport::Msg::Arm {
+                        frame: k,
+                        delta: self.arm_delta.unwrap_or(0),
+                    });
                 }
             } else if let Some(k) = self.session.arm_frame() {
                 // The guest honors the host's announcement (a later one supersedes).
@@ -703,10 +733,26 @@ impl Live {
             }
             if let Some(k) = self.arm_frame {
                 if frame_count() >= k {
-                    // The flip. Derive how many steps the engine already ran itself and
-                    // fast-forward the session past them: the counter is simulation
-                    // state, so both clients compute the same delta at the same frame.
-                    let delta = turn_count().wrapping_sub(self.takeover_turn);
+                    // The flip. The session fast-forward is the number of engine steps
+                    // the lockstep already ran: the two clients' takeover detections can
+                    // differ by a few network steps (the replay load completes at
+                    // slightly different frames), so the HOST's delta is the single
+                    // source of truth — it computes it here, sends it once more, and the
+                    // guest uses the announced value. A guest that somehow flipped
+                    // without a delta (a lost final Arm) falls back to its own count
+                    // rather than stall forever.
+                    let delta = if self.session.local_slot() == 0 {
+                        let d = turn_count().wrapping_sub(self.takeover_turn);
+                        self.arm_delta = Some(d);
+                        if let Some(link) = self.link.as_mut() {
+                            link.send(crate::transport::Msg::Arm { frame: k, delta: d });
+                        }
+                        d
+                    } else {
+                        self.session
+                            .arm_delta()
+                            .unwrap_or_else(|| turn_count().wrapping_sub(self.takeover_turn))
+                    };
                     // A computer player cannot be rolled back: refuse to flip (the match
                     // stays pure lockstep). CM_ROLLBACK_ALLOW_AI overrides.
                     if computer_player_present()
@@ -750,6 +796,14 @@ impl Live {
     fn begin_driving(&mut self, delta: u32) {
         set_driving(true);
         self.session.advance_to(delta);
+        // Seed the snapshot ring with the flip frame: the first driving steps frequently
+        // mispredict (the peer's early turns arrive a step or two late), and the rollback
+        // target is exactly this frame. Without a snapshot here the restore fails and the
+        // match hands back to lockstep on the very first correction.
+        let snap = unsafe { Snapshot::capture(self.ranges) };
+        self.ring.retain(|(f, _)| *f != delta);
+        self.ring.push((delta, snap));
+        self.ring.sort_by_key(|(f, _)| *f);
         log(&format!(
             "[cosmo-rollback] live: both sides armed — driving from step {delta} \
              (the engine ran {delta} steps itself before the flip)"
@@ -904,6 +958,17 @@ impl Live {
                     log(&format!(
                         "[cosmo-rollback] live: no snapshot for restore frame {rf}; handing \
                          the match back to the engine's turn path (cannot roll back)"
+                    ));
+                    // Ring forensics: which frames the ring holds, the rollback target and
+                    // the table's misprediction mark, so a ring-vs-target gap is diagnosed
+                    // from the log alone.
+                    log(&format!(
+                        "[cosmo-rollback] live: ring frames {:?} rollback_to {:?} mispredicted {:?} \
+                         spacing {} current {current}",
+                        self.ring.iter().map(|(f, _)| *f).collect::<Vec<_>>(),
+                        plan.rollback_to,
+                        self.session.table_mispredicted(),
+                        plan.spacing,
                     ));
                     self.no_peer = true;
                     set_driving(false);

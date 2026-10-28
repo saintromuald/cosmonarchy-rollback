@@ -31,6 +31,10 @@ pub struct TickPlan {
     pub confirmed: u32,
     /// Snapshots are taken of every frame that is a multiple of this.
     pub spacing: u32,
+    /// The earliest snapshot the ring can hold (the flip frame, seeded at the arming
+    /// handshake). A restore must never round below it: the ring starts at the flip and
+    /// the pre-flip frames are gone (dropped by the fast-forward).
+    pub earliest_snapshot: u32,
 }
 
 /// The step about to run.
@@ -62,6 +66,7 @@ impl TickPlan {
         confirmed: u32,
         mispredicted: Option<u32>,
         spacing: u32,
+        earliest_snapshot: u32,
     ) -> Self {
         let spacing = spacing.max(1);
         // A rollback only makes sense for a frame the simulation has already passed.
@@ -71,6 +76,7 @@ impl TickPlan {
             present,
             confirmed,
             spacing,
+            earliest_snapshot,
         }
     }
 
@@ -93,13 +99,25 @@ impl TickPlan {
     }
 
     /// The snapshot frame to restore for a rollback: the newest multiple of `spacing` at
-    /// or before the rollback target. `None` when the tick does not roll back.
+    /// or before the rollback target, clamped to the ring's earliest snapshot. `None`
+    /// when the tick does not roll back, or when the target predates the ring (a pre-flip
+    /// misprediction — the caller hands the match back).
     pub fn restore_frame(&self, current: u32) -> Option<u32> {
         if !self.restores(current) {
             return None;
         }
         let target = self.rollback_to.unwrap_or(current);
-        Some(target - (target % self.spacing))
+        let aligned = target - (target % self.spacing);
+        if aligned < self.earliest_snapshot {
+            // The target is inside the pre-flip fast-forward the ring can no longer reach.
+            if target >= self.earliest_snapshot {
+                Some(self.earliest_snapshot)
+            } else {
+                None
+            }
+        } else {
+            Some(aligned)
+        }
     }
 
     /// The steps the tick runs, in order, each producing the next frame.
@@ -132,7 +150,7 @@ mod tests {
 
     #[test]
     fn a_clean_tick_steps_one_frame_and_snapshots_on_spacing() {
-        let plan = TickPlan::new(10, 11, 11, None, 3);
+        let plan = TickPlan::new(10, 11, 11, None, 3, 0);
         assert!(!plan.restores(10));
         assert_eq!(plan.restore_frame(10), None);
         let steps: Vec<_> = plan.steps(10).collect();
@@ -147,7 +165,7 @@ mod tests {
     #[test]
     fn a_misprediction_rolls_back_to_the_snapshot_at_or_before_it() {
         // Simulation is on frame 10; a turn contradicted the prediction for frame 7.
-        let plan = TickPlan::new(10, 11, 11, Some(7), 3);
+        let plan = TickPlan::new(10, 11, 11, Some(7), 3, 0);
         assert!(plan.restores(10));
         assert_eq!(plan.restore_frame(10), Some(6));
         // Steps run from the restored frame 6 through to frame 11.
@@ -166,14 +184,14 @@ mod tests {
 
     #[test]
     fn a_misprediction_at_or_after_the_present_does_not_roll_back() {
-        let plan = TickPlan::new(10, 11, 11, Some(11), 3);
+        let plan = TickPlan::new(10, 11, 11, Some(11), 3, 0);
         assert!(!plan.restores(10));
         assert_eq!(plan.restore_frame(10), None);
     }
 
     #[test]
     fn spacing_zero_is_treated_as_one() {
-        let plan = TickPlan::new(4, 5, 5, Some(2), 0);
+        let plan = TickPlan::new(4, 5, 5, Some(2), 0, 0);
         assert_eq!(plan.spacing, 1);
         assert_eq!(plan.restore_frame(4), Some(2));
     }
