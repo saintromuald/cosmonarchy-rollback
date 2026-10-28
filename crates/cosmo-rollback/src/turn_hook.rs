@@ -64,6 +64,7 @@ use std::sync::Mutex;
 use once_cell::sync::Lazy;
 
 use crate::log::log;
+use crate::turns::SYNC_NOP;
 
 // The injection primitive (see module docs for the convention). `stdcall` because the
 // function does `ret 8` (callee cleans its two stack arguments).
@@ -376,6 +377,26 @@ pub fn walk_turn(bytes: &[u8]) -> (Vec<(u8, u32)>, bool) {
 }
 
 pub fn inject_turn(player_id: u32, bytes: &[u8], replay_flag: bool) {
+    // The engine's own empty turn is the single 0x05 marker (the pipeline flush writes
+    // it into the buffer when nothing was queued). An *empty* buffer is never valid:
+    // `Vec::new().as_ptr()` is Rust's dangling pointer 0x1, and any hook that reads the
+    // command head before checking the length faults at address 1 (the plus plugin's
+    // casting hook crashed the game exactly this way when a table entry came through
+    // empty at a fixed step). Substitute the engine's marker so the dispatcher sees the
+    // same bytes it would from its own flush.
+    let bytes = if bytes.is_empty() {
+        static WARNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 8 {
+            log(&format!(
+                "[cosmo-rollback] inject #{n}: empty turn for player {player_id} — \
+                 substituting the engine's 0x05 empty-turn marker"
+            ));
+        }
+        &[SYNC_NOP][..]
+    } else {
+        bytes
+    };
     // Log the payload *before* the call: the engine's crash report cannot symbolise a fault
     // through a bad pointer, so the last line printed is what localises it.
     let n_log = INJECT_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
