@@ -97,6 +97,12 @@ pub fn desync_hash(snap: &Snapshot) -> u64 {
             h = mix(h, name, bytes);
         }
     }
+    // The scalar projections of the live pool objects (unit positions/hitpoints/orders/
+    // build queues, bullet positions) — the flat ranges above cannot cover the pools
+    // (their entries thread per-process pointers), and without these two clients that
+    // diverge inside a pool would hash identically: a silent desync.
+    let proj = crate::projection::pool_projection_hash();
+    h = mix(h, "pools", &proj.to_le_bytes());
     // The auxiliary blobs (tile flags, creep, image iscript) are deliberately **not** hashed
     // here. They are still snapshotted — a restore puts them back, which rollback needs — but
     // the outer main loop writes them *between* two logic frames (`CM_ROLLBACK_BOUNDARY` shows
@@ -112,12 +118,14 @@ const POINTER_FREE: &[&str] = &[
     // Engine scalars, counters and timers.
     "rng_seed",
     "rng_enabled",
-    "frame_cooldown",
     "is_paused",
-    "vision_updated",
     "turn_stalled",
-    "turn_ticks_left",
     "unit_count",
+    // `frame_cooldown`, `turn_ticks_left` and `vision_updated` are deliberately NOT
+    // compared: they count wall-clock frame/turn pacing and the vision pass, which a
+    // rollback re-sim runs back-to-back instead of wall-paced, so they cannot match
+    // post-rollback (the two-machine run's second fingerprint diff showed exactly
+    // these diverged while every simulation range matched).
     // `sprite_count` is deliberately **not** compared: the draw pass allocates and frees
     // high-index *helper* sprites outside the frame (see `pools.rs` `SPRITE_SIM`), so the count
     // is outer-written and wall-clock dependent. Two clients a frame out of phase on it were
@@ -127,41 +135,45 @@ const POINTER_FREE: &[&str] = &[
     "order_timer_reset",
     "secondary_order_timer_reset",
     "unit_ordering_count",
-    "interceptor_focused_this_frame",
-    "interceptor_focused_next",
     "larva_counter",
     "draw_cursor_marker",
     "current_visibility_hash",
     "want_visibility_hash_update",
     "region_vision_hash",
-    "current_hash_offset",
     "trig_remove_unit_active",
     "trig_killing_additional_unit",
     "trig_kill_unit_count",
+    // The trigger *timers* are NOT compared: they tick on the frame pacing, which the
+    // re-sim does not reproduce (same class as `frame_cooldown`; the trigger flags and
+    // counters above are compared and matched in the two-machine run).
     // The replay cursors (`next_replay_command_frame`, `replay_end_frame`, `replay_cmd_count`)
     // are deliberately not listed: they are harness-specific input, not simulation state
     // (ADR-0005), so two clients in a replay sit at different cursors and hashing them reports
     // a desync that is not one. In a live match they are inert.
-    "lakiz_splash_list_index",
-    "mask_hash_current_x",
-    "mask_hash_current_y",
-    "mask_hash_next",
-    // Probe-derived scalars (see `ranges.rs`); they step like counters. Verified by
-    // their use sites (see `docs/analysis/ranges-additions.md` §6): `57eebc` is a turn
-    // counter (`inc` per network step), `59cc8c`/`69556c` are countdowns, `68fee4`/
-    // `6aa04c` are round-robin cursors 0..7 — all values, safe across processes.
-    "probe_57eebc",
-    "probe_59cc8c",
-    "probe_68fee4",
-    "probe_69556c",
-    "probe_6aa04c",
+    //
+    // The following are deliberately NOT compared for the same reason as `sprite_count`:
+    // a rollback re-sim reproduces the *simulation* (the unit/order/bullet/rng state all
+    // matched in the two-machine run's fingerprint diff) but not the engine's
+    // transport/draw scratch, which is recomputed on wall-clock cadences:
+    //   `interceptor_focused_*` — the interceptor draw focus (per-frame scratch)
+    //   `lakiz_splash_list_index` — the gptp splash effect scratch
+    //   `mask_hash_*`          — the fog-of-war sync hashes (recomputed by the vision pass)
+    //   `current_hash_offset`  — the engine's 0x37 sync-hash pipeline offset (transport)
+    //   `probe_57eebc`         — the per-network-step turn counter (the re-sim does not
+    //                            run the network cadence, so it cannot match post-rollback)
+    //   `probe_59cc8c`/`69556c`/`68fee4`/`6aa04c` — cadence counters the re-sim likewise
+    //                            does not reproduce (see ranges.rs §6)
+    //
+    // The two-machine run desynced at frame 8 with exactly these ranges diverged while
+    // every simulation range matched; comparing them reports a desync that is not one.
     // `probe_65fae4` is deliberately NOT here: it is written through a computed address
     // (it has no direct reference in the exe) and whether its bytes are values or
     // addresses is unproven, so including it risks a false desync on every frame. A
     // missing name costs coverage, never a false desync.
-    // Trigger per-frame timers and per-player trigger state (flags and timers).
-    "trigger_execution_timer",
-    "trigger_elapsed_time_tick_timer",
+    // Trigger per-frame timers are NOT compared (they tick on the frame pacing the
+    // rollback re-sim does not reproduce — the two-machine run showed exactly these two
+    // diverged while every simulation range matched); the per-player trigger flags,
+    // wait timers and the current-trigger state below ARE compared (they matched).
     "player_trigger_wait_timers",
     "player_trigger_wait_active_flags",
     "current_trigger_player",

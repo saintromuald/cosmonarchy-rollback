@@ -58,6 +58,13 @@ pub struct Session {
     authority_lead: Option<(u32, u32, u32)>,
     /// The authority's most recent per-slot turn counts, if any.
     authority_turns: Option<[u32; crate::transport::SLOTS]>,
+    /// The flip frame the host announced in the arming handshake, if any.
+    arm_frame: Option<u32>,
+    /// The announced session fast-forward (0 while the host has not filled it in).
+    arm_delta: Option<u32>,
+    /// The earliest snapshot frame the ring holds (the flip fast-forward); rollback
+    /// restore targets are clamped to it.
+    earliest_snapshot: u32,
     /// Our own desync hash for each recently settled frame, so a peer's hash can be compared
     /// the moment it *arrives* — it may well arrive after we settled that frame.
     own_hashes: std::collections::VecDeque<(u32, u64)>,
@@ -111,6 +118,9 @@ impl Session {
             pending_rollback: None,
             authority_lead: None,
             authority_turns: None,
+            arm_frame: None,
+            arm_delta: None,
+            earliest_snapshot: 0,
             own_hashes: std::collections::VecDeque::new(),
             peer_reports: Vec::new(),
             sent: std::collections::VecDeque::new(),
@@ -147,10 +157,21 @@ impl Session {
     /// Takes every message the link has for us: turns go into the input table **by sequence
     /// number** (the wire is lossy and unordered), peer hashes into the desync comparison,
     /// and leaves into the leave schedule. The engine-facing caller runs this once per
-    /// frame, before [`plan`](Self::plan).
-    pub fn absorb(&mut self, link: &mut impl crate::transport::Link, now: Instant) {
+    /// frame, before [`plan`](Self::plan). Returns how many messages were absorbed.
+    pub fn absorb(&mut self, link: &mut impl crate::transport::Link, now: Instant) -> usize {
         use crate::transport::Msg;
+        let mut taken = 0usize;
+        static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         while let Some(msg) = link.recv() {
+            taken += 1;
+            if let Msg::Turn { slot, frame, bytes } = &msg {
+                if std::env::var("CM_ROLLBACK_LOG_ABSORB").is_ok() {
+                    crate::log::log(&format!(
+                        "[cosmo-rollback] absorb turn #{taken}: slot {slot} frame {frame} len {}",
+                        bytes.len()
+                    ));
+                }
+            }
             match msg {
                 Msg::Turn { slot, frame, bytes } => {
                     self.push_remote_seq(slot as usize, frame, bytes, now)
@@ -165,6 +186,16 @@ impl Session {
                         self.peer_acked = Some(self.peer_acked.map_or(seq, |a| a.max(seq)));
                     }
                 }
+                Msg::Arm { frame, delta } => {
+                    // The arming handshake: the host announces the flip frame and the
+                    // session fast-forward. A later announcement supersedes an earlier
+                    // one (the host re-sends until the flip, with a possibly updated
+                    // frame and the delta filled in at the flip).
+                    self.arm_frame = Some(self.arm_frame.map_or(frame, |f| f.max(frame)));
+                    if delta != 0 {
+                        self.arm_delta = Some(delta);
+                    }
+                }
                 Msg::LeadReport {
                     median_lateness,
                     p90_lateness,
@@ -173,6 +204,7 @@ impl Session {
                 Msg::TurnsComplete { counts } => self.authority_turns = Some(counts),
             }
         }
+        taken
     }
 
     /// The authority's most recent `(median_lateness, p90_lateness, clock_stopped_ms)`.
@@ -183,6 +215,23 @@ impl Session {
     /// The authority's most recent per-slot turn counts.
     pub fn authority_turns(&self) -> Option<[u32; crate::transport::SLOTS]> {
         self.authority_turns
+    }
+
+    /// The flip frame the host announced in the arming handshake, if any.
+    pub fn arm_frame(&self) -> Option<u32> {
+        self.arm_frame
+    }
+
+    /// The session fast-forward the host announced alongside the flip frame.
+    pub fn arm_delta(&self) -> Option<u32> {
+        self.arm_delta
+    }
+
+    /// Whether any turn has been received from `slot` (the arming handshake's "the peer
+    /// is running the plugin" signal — keyed on traffic, not on the contiguous frontier,
+    /// so a lost turn 0 cannot misclassify an armed peer as absent).
+    pub fn peer_has_spoken(&self, slot: usize) -> bool {
+        self.table.slot_has_any(slot)
     }
 
     /// `slot`'s recent turn lateness as `(median, p90)` steps, for the authority's
@@ -282,10 +331,16 @@ impl Session {
             self.confirmed,
             self.table.mispredicted(),
             self.spacing,
+            self.earliest_snapshot,
         );
         self.resimulating = plan.restores(self.current);
         self.pending_rollback = plan.rollback_to;
         plan
+    }
+
+    /// The input table's misprediction mark (the earliest step a late turn contradicted).
+    pub fn table_mispredicted(&self) -> Option<u32> {
+        self.table.mispredicted()
     }
 
     /// The turn `frame` dispatches for every slot, to be injected before stepping it.
@@ -419,6 +474,18 @@ impl Session {
     /// The local player's slot.
     pub fn local_slot(&self) -> usize {
         self.local_slot
+    }
+
+    /// Fast-forwards the session past steps the engine already ran itself while the
+    /// client was waiting for the peer's first rollback turn (the arming handshake's
+    /// pending phase): `steps` is the engine's per-network-step turn count. Turns for
+    /// those steps were applied by the engine, so the session's input table drops them
+    /// and the confirmed frontier starts at `steps`.
+    pub fn advance_to(&mut self, steps: u32) {
+        self.table.advance_to(steps);
+        self.current = self.current.max(steps);
+        self.confirmed = self.confirmed.max(steps).min(self.current);
+        self.earliest_snapshot = steps;
     }
 
     /// Drains the peer hash reports that arrived since the last call, as `(slot, frame, hash)`

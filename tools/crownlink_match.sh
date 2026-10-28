@@ -6,9 +6,13 @@
 # menu occupies x=160..1120.
 #
 #   tools/crownlink_match.sh run   [host_session] [host_display] [host_root] [join_session] [join_display] [join_root] [game]
-#   tools/crownlink_match.sh host  <session> <display> <root>          (game must already be up)
-#   tools/crownlink_match.sh join  <session> <display> <root> [game]   (game must already be up)
+#   tools/crownlink_match.sh host  <session> <display> <root> [slot]          (game must already be up)
+#   tools/crownlink_match.sh join  <session> <display> <root> [slot] [game]   (game must already be up)
 #   tools/crownlink_match.sh boot  <session> <display> <root>
+#
+# `host`/`join` take an optional slot (0/1): passing one arms the live client
+# (CM_ROLLBACK_LIVE + CM_ROLLBACK_SLOT), which is how a two-machine match arms each
+# side — see tools/crownlink_cross.sh.
 #
 # `run` starts both clients first and only then drives them: restarting a session while the
 # other is in a lobby tears the lobby down (wine/proton teardown is not prefix-scoped in
@@ -58,10 +62,11 @@ PY
     if [[ -n "$slot" ]]; then
         export CM_ROLLBACK_LIVE=1
         export CM_ROLLBACK_SLOT="$slot"
-        export CM_ROLLBACK_NO_PLUGIN=1
-        # The engine applies the match's start turns itself before the client takes over;
-        # injecting them again replays game init on an initialised world.
-        export CM_ROLLBACK_SKIP_START_TURNS="${CM_ROLLBACK_SKIP_START_TURNS:-2}"
+        # Plugin-state snapshots are excluded by default (the shipped plugins have no
+        # serializers); CM_ROLLBACK_NO_PLUGIN=0 runs the shipped-match configuration.
+        if [[ "${CM_ROLLBACK_NO_PLUGIN:-}" != "0" ]]; then
+            export CM_ROLLBACK_NO_PLUGIN=1
+        fi
         # One-way delay on our own channel messages, so a same-machine match still mispredicts
         # and therefore exercises prediction + rollback for real.
         if [[ -n "${CL_SEND_DELAY_MS:-}" ]]; then
@@ -98,7 +103,7 @@ goto_map_root() { # session
     local s="$1" i label xy
     for i in 1 2 3 4 5 6; do
         shot "$s" "maproot-$i"
-        label="$(python3 "$ROOT/tools/ocr_text.py" "$(state "$s")/maproot-$i.png" 240 150 340 30 7)"
+        label="$(python3 "$ROOT/tools/ocr_text.py" "$(state "$s")/maproot-$i.png" 240 140 360 60 7)"
         # The pixel font reads "CMBW-maps" as e.g. "CNVBW -maps", so match loosely: the root is
         # the only level whose folder label contains "maps" ("melee", "replays", a class
         # folder, ... do not).
@@ -112,7 +117,7 @@ goto_map_root() { # session
 }
 
 open_multiplayer() { # session [profile]
-    local s="$1" name="${2:-alpha}" title
+    local s="$1" name="${2:-alpha}" title chooser
     click "$s" 361 298 4     # Multiplayer
     # A fresh install has no profile: the registry asks for a name first. Create one so the
     # harness works on a clean copy (a real player does this once, by hand).
@@ -123,62 +128,82 @@ open_multiplayer() { # session [profile]
         "$S" key "$s" Return
         sleep 2
         echo "  created profile '$name'"
+        click "$s" 931 589 6     # Registry -> Ok
+    else
+        # A tree with several profiles shows the chooser (New/Delete/Ok/Cancel): Enter
+        # accepts the highlighted profile (the chooser has focus at this point), which
+        # proceeds straight to the games list.
+        chooser="$(python3 "$ROOT/tools/ocr_text.py" "$(state "$s")/registry.png" 290 440 700 200 6 2>/dev/null)"
+        if [[ "$chooser" == *[Nn]ew* && "$chooser" == *[Dd]elete* ]]; then
+            "$S" key "$s" Return
+            sleep 4
+            echo "  profile chooser accepted"
+        fi
     fi
-    click "$s" 931 589 6     # Registry -> Ok
 }
 
 host_steps() { # session
-    local s="$1"
+    local s="$1" xy x y
     open_multiplayer "$s" "${CL_HOST_PROFILE:-alpha}"
     shot "$s" mp
-    click "$s" 350 514 6     # Create Game
+    click "$s" 353 500 6     # Create Game
     shot "$s" create
     goto_map_root "$s" || echo "  warning: map browser not at its root"
-    dblclick "$s" 321 266    # [melee]
-    dblclick "$s" 309 210    # [1v1]
-    dblclick "$s" 397 237    # [Class 0 - Testing Grounds]
-    dblclick "$s" 383 210    # [1. Standard-Bearers]
+    # Walk the folder levels by OCR: a single click selects the row and Enter opens it
+    # (the browser's Ok button does not open folders at every level, and the rows have
+    # drifted from the old fixed coordinates).
+    for folder in "melee" "1v1" "Class 0 - Testing Grounds" "1. Standard-Bearers"; do
+        xy="$(pick_map "$s" "$folder")" || { shot "$s" "mapnav-$folder"; die "folder '$folder' not found"; }
+        read -r x y <<<"$xy"
+        onscreen "$s" xdotool mousemove "$x" "$y" click 1
+        sleep 2
+        "$S" key "$s" Return
+        sleep 4
+    done
     shot "$s" maplist
     # The lobby carries only the map's *name*, and this install has maps whose names collide
     # after the version suffix is stripped (two "Pagan Imperium"), which makes the joiner load
     # the wrong file and fail the join. Pick a map whose name is unique.
-    local map="${CL_MAP:-Potivector}"
+    local map="${CL_MAP:-Sylphid}"
     local xy mx my
     xy="$(pick_map "$s" "$map")" || { shot "$s" maplist-fail; die "map '$map' not found"; }
     read -r mx my <<<"$xy"
     onscreen "$s" xdotool mousemove "$mx" "$my" click 1
     sleep 2
-    click "$s" 931 589 8     # Ok -> lobby
+    "$S" key "$s" Return
+    sleep 5
     shot "$s" lobby
 }
 
 join_steps() { # session game
     local s="$1" want="${2:-alpha}" title="" attempt xy x y
     open_multiplayer "$s" "${CL_JOIN_PROFILE:-beta}"
+    # The host's game carries the shared lobby password, and the public games list
+    # only shows games matching the viewer's own filter: set the same password or the
+    # list stays empty. The filter row sits at the bottom of the games screen
+    # (Password / Set / Clear).
+    click "$s" 585 660 4    # Set
+    "$S" type "$s" "${CL_PASSWORD:-rollback-test}"
+    "$S" key "$s" Return
+    sleep 3
     shot "$s" games
-    for attempt in 1 2 3 4 5; do
-        xy="$(pick_row "$s" "$want")" || { sleep 3; continue; }
-        read -r x y <<<"$xy"
-        onscreen "$s" xdotool mousemove "$x" "$y" click 1
-        shot "$s" "select-$attempt"
-        title="$(python3 "$ROOT/tools/ocr_text.py" "$(state "$s")/select-$attempt.png" 840 110 200 30 7)"
-        echo "  attempt $attempt: clicked ($x,$y), title reads '$title'"
-        [[ "${title,,}" == *"${want,,}"* ]] && break
-        sleep 2
-    done
-    [[ "${title,,}" == *"${want,,}"* ]] || die "could not select '$want' (last title '$title')"
-    click "$s" 931 589 12    # Ok -> join
+    # The password filter leaves exactly one game in the list: take the first row
+    # (its title is the host's player name, which is whatever profile the host picked,
+    # so matching by name is not reliable).
+    click "$s" 400 174 3
+    shot "$s" "select"
+    click "$s" 900 559 12    # Ok -> join
     shot "$s" joined
 }
 
 case "$CMD" in
 host|join|boot)
-    NAME="${2:-}"; DISPLAY_NUM="${3:-}"; GAME_ROOT="${4:-}"
-    [[ -n "$NAME" && -n "$DISPLAY_NUM" && -n "$GAME_ROOT" ]] || die "usage: $0 $CMD <session> <display> <root>"
-    boot_session "$NAME" "$DISPLAY_NUM" "$GAME_ROOT"
+    NAME="${2:-}"; DISPLAY_NUM="${3:-}"; GAME_ROOT="${4:-}"; SLOT="${5:-${CM_SLOT:-}}"
+    [[ -n "$NAME" && -n "$DISPLAY_NUM" && -n "$GAME_ROOT" ]] || die "usage: $0 $CMD <session> <display> <root> [slot] [game]"
+    boot_session "$NAME" "$DISPLAY_NUM" "$GAME_ROOT" "$SLOT"
     case "$CMD" in
         host) host_steps "$NAME" ;;
-        join) join_steps "$NAME" "${5:-alpha}" ;;
+        join) join_steps "$NAME" "${6:-alpha}" ;;
     esac
     ;;
 run)
@@ -195,7 +220,7 @@ run)
     host_steps "$HOST_S"
     join_steps "$JOIN_S" "$GAME"
     echo "run: lobby ready (host $HOST_S, joiner $JOIN_S); starting the game"
-    click "$HOST_S" 931 589 5   # lobby Ok starts the match
+    click "$HOST_S" 900 559 5   # lobby Ok starts the match
     sleep "${CM_START_WAIT:-45}"
     shot "$HOST_S" ingame
     shot "$JOIN_S" ingame

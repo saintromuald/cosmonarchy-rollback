@@ -64,6 +64,7 @@ use std::sync::Mutex;
 use once_cell::sync::Lazy;
 
 use crate::log::log;
+use crate::turns::SYNC_NOP;
 
 // The injection primitive (see module docs for the convention). `stdcall` because the
 // function does `ret 8` (callee cleans its two stack arguments).
@@ -122,10 +123,15 @@ pub fn install(exe: &mut whack::ModulePatcher) {
                     // size so the flush sends the engine's empty-turn marker instead; the
                     // pipeline, the game-start loop and the acknowledgement plumbing all keep
                     // working (see `rollback/live.rs`).
-                    // Only in a match: zeroing the buffer in the lobby would also discard the
-                    // lobby's own turn payloads (the engine sends the map/lobby state over the
-                    // same turns), and the joiner would never receive the map.
-                    if crate::rollback::live::enabled() && crate::rollback::live::in_game() {
+                    // Only in a match, and only while the client is *driving*: zeroing the
+                    // buffer in the lobby would also discard the lobby's own turn payloads
+                    // (the engine sends the map/lobby state over the same turns), and the
+                    // joiner would never receive the map. During the arming pending phase
+                    // and after a handoff the engine's own turns flow untouched.
+                    if crate::rollback::live::enabled()
+                        && crate::rollback::live::in_game()
+                        && crate::rollback::live::driving()
+                    {
                         *(G_COMMAND_QUEUE_SIZE as *mut u32) = 0;
                     }
                     orig()
@@ -237,7 +243,13 @@ fn read_local_turn() -> (u32, Vec<u8>) {
 }
 
 /// Capture the local turn into [`CAPTURED`], called at the `FillPipeline` entry.
+///
+/// The live client reads the buffer directly (`local_turn`), so its captures are not
+/// enqueued — the queue would grow without a consumer for the whole session.
 fn capture_local_turn() {
+    if crate::rollback::live::enabled() {
+        return;
+    }
     let (frame, bytes) = read_local_turn();
     if let Ok(mut q) = CAPTURED.lock() {
         q.push_back((frame, bytes.clone()));
@@ -351,16 +363,40 @@ pub fn walk_turn(bytes: &[u8]) -> (Vec<(u8, u32)>, bool) {
             return (out, false);
         }
         let len = unsafe { *(LENGTHS as *const u32).add(id as usize) };
-        out.push((id, len));
-        p += 1 + len as usize;
-        if p > bytes.len() {
+        // The table has no entry for the special sync commands (e.g.
+        // `GameCommand_Hash` 0x37 reads 0xFFFFFFFF here — the engine handles it by a
+        // dedicated path, not the generic walker), and a length that would run past
+        // the end is a malformed turn. Both are "incomplete", never an overflow.
+        if len as usize > bytes.len() - p - 1 {
             return (out, false);
         }
+        out.push((id, len));
+        p += 1 + len as usize;
     }
     (out, p == bytes.len())
 }
 
 pub fn inject_turn(player_id: u32, bytes: &[u8], replay_flag: bool) {
+    // The engine's own empty turn is the single 0x05 marker (the pipeline flush writes
+    // it into the buffer when nothing was queued). An *empty* buffer is never valid:
+    // `Vec::new().as_ptr()` is Rust's dangling pointer 0x1, and any hook that reads the
+    // command head before checking the length faults at address 1 (the plus plugin's
+    // casting hook crashed the game exactly this way when a table entry came through
+    // empty at a fixed step). Substitute the engine's marker so the dispatcher sees the
+    // same bytes it would from its own flush.
+    let bytes = if bytes.is_empty() {
+        static WARNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 8 {
+            log(&format!(
+                "[cosmo-rollback] inject #{n}: empty turn for player {player_id} — \
+                 substituting the engine's 0x05 empty-turn marker"
+            ));
+        }
+        &[SYNC_NOP][..]
+    } else {
+        bytes
+    };
     // Log the payload *before* the call: the engine's crash report cannot symbolise a fault
     // through a bad pointer, so the last line printed is what localises it.
     let n_log = INJECT_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

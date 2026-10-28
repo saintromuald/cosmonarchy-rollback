@@ -48,6 +48,16 @@ start)
 
     (
         cd "$BASE/$BUILD" || exit 1
+        # Passthrough for the rollback env knobs (the gate's CM_ROLLBACK_SHADOW, the
+        # live client's CM_ROLLBACK_LIVE/SLOT/UDP, etc.) so a scripted session can
+        # drive any mode.
+        for var in $(env | grep -o '^CM_ROLLBACK_[A-Z0-9_]*'); do
+            export "$var"
+        done
+        # The wine sync backend (ntsync wedges after a kill-storm; esync works).
+        for var in $(env | grep -o '^PROTON_[A-Z_]*'); do
+            export "$var"
+        done
         WINEPREFIX="$GAME_ROOT/prefix" PROTONPATH=GE-Proton \
         GAMEID="umu-cosmo-$NAME-$BUILD" PROTON_VERB=waitforexitandrun \
         DISPLAY="$DISPLAY_NUM" WAYLAND_DISPLAY= setsid umu-run "C:\\Cosmonarchy\\$BUILD\\Cosmonarchy BW.exe" \

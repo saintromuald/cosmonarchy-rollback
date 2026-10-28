@@ -19,7 +19,8 @@ use std::time::Instant;
 /// Bumped when the encoding changes; a peer with a different version is rejected rather
 /// than misparsed. Version 2 added the reporting slot to `Hash` (v1 was ambiguous about
 /// which peer a hash came from) and the authority's `LeadReport`/`TurnsComplete`.
-pub const WIRE_VERSION: u8 = 2;
+/// Version 4 added the delta to `Arm` (the announced session fast-forward).
+pub const WIRE_VERSION: u8 = 4;
 
 /// Largest turn blob accepted, to bound allocation from a hostile or corrupt peer. A turn
 /// is a frame's worth of commands; 4 KiB is far above anything the engine produces.
@@ -31,6 +32,7 @@ const TAG_LEAVE: u8 = 3;
 const TAG_LEAD_REPORT: u8 = 4;
 const TAG_TURNS_COMPLETE: u8 = 5;
 const TAG_ACK: u8 = 6;
+const TAG_ARM: u8 = 7;
 
 /// Slots the engine's turn scheduler can have; the authority's `TurnsComplete` reports one
 /// count per slot.
@@ -64,6 +66,19 @@ pub enum Msg {
     /// the clients permanently. The receiver therefore acknowledges and the sender re-sends
     /// everything above the ack (ADR-0006).
     Ack { slot: u8, seq: u32 },
+    /// The arming handshake: the host announces the sim frame at which both clients take
+    /// over driving (the flip). Both sides then flip at that exact frame, so their
+    /// sessions align deterministically no matter when the messages arrive. Sent by the
+    /// host once it has seen the guest's traffic, and re-sent until the flip (it travels
+    /// over plain UDP).
+    /// The host's arming announcement: the deterministic flip frame and the session
+    /// fast-forward both clients must use. The delta is the host's engine turn count
+    /// since takeover: the two clients' takeover detections can differ by several
+    /// network steps (the replay load completes at slightly different frames), so each
+    /// side's own `turn_count() - takeover_turn` disagrees — the announced delta is the
+    /// single source of truth (a delta of 0 means "not yet known": the host fills it in
+    /// at its flip and re-sends until then).
+    Arm { frame: u32, delta: u32 },
 }
 
 impl Msg {
@@ -73,6 +88,7 @@ impl Msg {
             Msg::Turn { frame, .. } | Msg::Hash { frame, .. } => *frame,
             Msg::Leave { step, .. } => *step,
             Msg::Ack { seq, .. } => *seq,
+            Msg::Arm { frame, .. } => *frame,
             Msg::LeadReport { .. } | Msg::TurnsComplete { .. } => 0,
         }
     }
@@ -84,7 +100,7 @@ impl Msg {
             | Msg::Hash { slot, .. }
             | Msg::Leave { slot, .. }
             | Msg::Ack { slot, .. } => Some(*slot),
-            Msg::LeadReport { .. } | Msg::TurnsComplete { .. } => None,
+            Msg::LeadReport { .. } | Msg::TurnsComplete { .. } | Msg::Arm { .. } => None,
         }
     }
 
@@ -131,6 +147,11 @@ impl Msg {
                 out.push(TAG_ACK);
                 out.push(*slot);
                 out.extend_from_slice(&seq.to_le_bytes());
+            }
+            Msg::Arm { frame, delta } => {
+                out.push(TAG_ARM);
+                out.extend_from_slice(&frame.to_le_bytes());
+                out.extend_from_slice(&delta.to_le_bytes());
             }
         }
         out
@@ -200,6 +221,11 @@ impl Msg {
                 let seq = u32::from_le_bytes(take(&mut p, 4)?.try_into().ok()?);
                 Some((Msg::Ack { slot, seq }, p))
             }
+            TAG_ARM => {
+                let frame = u32::from_le_bytes(take(&mut p, 4)?.try_into().ok()?);
+                let delta = u32::from_le_bytes(take(&mut p, 4)?.try_into().ok()?);
+                Some((Msg::Arm { frame, delta }, p))
+            }
             _ => None,
         }
     }
@@ -214,11 +240,14 @@ pub trait Link {
 
     /// Whether the client must inject turns into the engine itself.
     ///
-    /// True for carriers with no engine-side turn source: the scripted replay harness and the
-    /// UDP test, where the peer's turns exist only in our input table. False for CrownLink: the
-    /// engine receives the peer's turns through the `.snp` and applies them itself, so injecting
-    /// the recorded copy as well applies every command twice — which crashes inside
-    /// `ProcessCommands` once the match's init turns are replayed.
+    /// Always true for a live carrier. The engine's own turn processor
+    /// (`0x00486F50`) is no-op'd by the live client (`rollback/live.rs::install`), and
+    /// CrownLink's rollback channel carries its packets under a dedicated sub-type that
+    /// **never enters the engine's lockstep receive queue** (RollbackChannel.h), so the
+    /// only thing that can ever apply a peer's turns to the simulation is the client's
+    /// own `ProcessCommands` injection. Leaving it to "the engine" would apply nothing —
+    /// the live match would run on empty input on both sides (the dead
+    /// mouse/keyboard symptom).
     fn inject_turns(&self) -> bool {
         true
     }
@@ -360,9 +389,20 @@ impl CrownLink {
 
 impl CrownLink {
     /// Hands one encoded message to the SNP.
+    ///
+    /// Turns, acks and the arming `Arm` are reliability-critical and travel over **both**
+    /// the direct P2P link and the relay (`cl_rollback_send_redundant`) — a relayed peer
+    /// whose direct path is blocked would otherwise never see them. Hash reports are
+    /// periodic and self-refreshing, so they use the plain broadcast (losing one only
+    /// delays the adjudication by one interval).
     fn transmit(&self, msg: &Msg) {
         let bytes = msg.encode();
-        let ok = unsafe { (self.api.broadcast)(bytes.as_ptr(), bytes.len() as u32) };
+        let ok = match msg {
+            Msg::Turn { .. } | Msg::Ack { .. } | Msg::Arm { .. } => unsafe {
+                (self.api.send_redundant)(bytes.as_ptr(), bytes.len() as u32)
+            },
+            _ => unsafe { (self.api.broadcast)(bytes.as_ptr(), bytes.len() as u32) },
+        };
         let n = SEND_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n <= 3 || n % 500 == 0 {
             crate::log::log(&format!(
@@ -385,7 +425,12 @@ impl CrownLink {
 
 impl Link for CrownLink {
     fn inject_turns(&self) -> bool {
-        false
+        // The live client injects every slot's turn on every carrier. The double-apply
+        // hazard that once motivated `false` here is handled the correct way: the
+        // match's start turns (which the engine applies itself before the client takes
+        // over) are skipped via `CM_ROLLBACK_SKIP_START_TURNS`, and the engine's turn
+        // processor is no-op'd so nothing else re-applies what the client injects.
+        true
     }
 
     fn send(&mut self, msg: Msg) {
@@ -417,6 +462,11 @@ pub struct UdpLink {
     pending: VecDeque<(Instant, Vec<u8>)>,
 }
 
+/// Traffic counters, matching CrownLink's channel counters so the two-client report
+/// (`tools/crownlink_match.sh report`) reads either carrier.
+static UDP_SEND_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static UDP_RECV_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 impl UdpLink {
     /// Binds `local` and sends to `127.0.0.1:peer`.
     pub fn new(local: u16, peer: u16, delay: std::time::Duration) -> Option<Self> {
@@ -435,6 +485,10 @@ impl UdpLink {
 impl Link for UdpLink {
     fn send(&mut self, msg: Msg) {
         let bytes = msg.encode();
+        let n = UDP_SEND_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 3 || n % 500 == 0 {
+            crate::log::log(&format!("[cosmo-rollback] live: channel send #{n} ({} bytes)", bytes.len()));
+        }
         if self.delay.is_zero() {
             let _ = self.socket.send_to(&bytes, self.peer);
         } else {
@@ -444,18 +498,33 @@ impl Link for UdpLink {
 
     fn recv(&mut self) -> Option<Msg> {
         // Release the datagrams whose delay has expired, then take one that arrived.
+        // The release is capped per call: a long backlog released in one burst would
+        // overflow the peer's socket receive buffer (a loopback burst of ~2k datagrams
+        // loses most of them), and the caller recv()s every tick anyway.
         let now = Instant::now();
-        while let Some((at, _)) = self.pending.front() {
-            if *at > now {
-                break;
+        let mut released = 0usize;
+        while released < 64 {
+            match self.pending.front() {
+                Some((at, _)) if *at <= now => {
+                    let bytes = self.pending.pop_front().expect("front").1;
+                    let _ = self.socket.send_to(&bytes, self.peer);
+                    released += 1;
+                }
+                _ => break,
             }
-            let bytes = self.pending.pop_front().expect("front").1;
-            let _ = self.socket.send_to(&bytes, self.peer);
         }
         let mut buf = [0u8; 2048];
         match self.socket.recv_from(&mut buf) {
             // A malformed datagram is dropped, never fatal.
-            Ok((n, _)) => Msg::decode(&buf[..n]).map(|(m, _)| m),
+            Ok((len, _)) => {
+                let n = UDP_RECV_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n <= 3 || n % 500 == 0 {
+                    crate::log::log(&format!(
+                        "[cosmo-rollback] live: channel recv #{n} ({len} bytes)"
+                    ));
+                }
+                Msg::decode(&buf[..len]).map(|(m, _)| m)
+            }
             Err(_) => None,
         }
     }
@@ -635,6 +704,7 @@ mod tests {
         round_trip(Msg::TurnsComplete {
             counts: [1, 2, 3, 4, 5, 6, 7, 8],
         });
+        round_trip(Msg::Arm { frame: 0x1234_5678, delta: 0x0000_0010 });
     }
 
     #[test]
@@ -698,5 +768,67 @@ mod tests {
         l.tick();
         assert_eq!(l.recv().unwrap().frame(), 1);
         assert_eq!(l.recv().unwrap().frame(), 2);
+    }
+
+    /// A delayed UDP link under a flood must not lose the turns sent before the flood
+    /// (regression: the two-client harness saw the flip's first turns vanish while
+    /// thousands of pending-phase sends were released around them).
+    #[test]
+    fn delayed_udp_link_does_not_lose_early_turns_under_a_flood() {
+        use std::time::Duration;
+        let mut tx = UdpLink::new(39501, 39502, Duration::from_millis(120))
+            .expect("bind tx");
+        let mut rx = UdpLink::new(39502, 39501, Duration::ZERO).expect("bind rx");
+        // The flood: 2000 messages, as the pending phase sends one per tick.
+        for i in 0..2000u32 {
+            tx.send(Msg::Turn { slot: 1, frame: i, bytes: vec![9] });
+        }
+        // The early turns the flip sends.
+        for i in 0..16u32 {
+            tx.send(Msg::Turn { slot: 1, frame: 10_000 + i, bytes: vec![7] });
+        }
+        // Let the delay elapse, then release the queue in bursts as the stalled ticks
+        // would, while the receiver drains.
+        std::thread::sleep(Duration::from_millis(200));
+        let mut seen_early = std::collections::HashSet::new();
+        let mut seen_flood = 0u32;
+        for _ in 0..8000 {
+            tx.recv();
+            while let Some(m) = rx.recv() {
+                if let Msg::Turn { frame, .. } = m {
+                    if (10_000..10_016).contains(&frame) {
+                        seen_early.insert(frame);
+                    } else if frame < 2000 {
+                        seen_flood += 1;
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        tx.recv();
+        while let Some(m) = rx.recv() {
+            if let Msg::Turn { frame, .. } = m {
+                if (10_000..10_016).contains(&frame) {
+                    seen_early.insert(frame);
+                } else if frame < 2000 {
+                    seen_flood += 1;
+                }
+            }
+        }
+        // The flood and the early turns are all small datagrams on a loopback socket:
+        // nothing should be lost. The flood itself may be sampled rather than counted
+        // exactly, but the early turns must all arrive.
+        assert_eq!(
+            seen_early.len(),
+            16,
+            "expected all 16 early turns, got {}: {:?} (flood arrivals sampled: {})",
+            seen_early.len(),
+            {
+                let mut v: Vec<u32> = seen_early.into_iter().collect();
+                v.sort();
+                v
+            },
+            seen_flood,
+        );
     }
 }

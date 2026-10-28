@@ -20,6 +20,19 @@
 # How many steps may run on prediction before the client stalls waiting for the peer.
 #CM_ROLLBACK_PREDICT=8
 #
+# The client fast-forwards past the steps the engine ran itself before the arming
+# flip (derived from the engine's own turn counter); this knob adds an explicit
+# extra diagnostic skip on top of that. Default 0.
+#CM_ROLLBACK_SKIP_START_TURNS=0
+#
+# How many frames ahead of its announcement the host places the arming flip, so the
+# announcement reaches the guest before its sim passes the flip frame.
+#CM_ROLLBACK_ARM_MARGIN=8
+#
+# Diagnostics: drive a match that has a computer player anyway (aise state is not
+# snapshotted, so expect hash divergences while its script runs).
+#CM_ROLLBACK_ALLOW_AI=1
+#
 # ---- diagnostics -------------------------------------------------------------------
 #
 # The shadow gate: re-simulate a frame and report state a restore did not reproduce.

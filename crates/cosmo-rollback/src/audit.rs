@@ -16,6 +16,10 @@ pub fn on_start() {
     // resolve each plugin's exports, and enable them for this session.
     log("[cosmo-rollback] loaded modules:");
     crate::modules::log_modules();
+    // Warm the module-list cache here, at load time: every later lookup walks the
+    // cache, and the snapshot API must never run on the game thread at frame time
+    // (the loader lock it takes deadlocks the game's first frame — see modules.rs).
+    crate::modules::module_list();
     let names = crate::plugin_state::plugin_names();
     log(&format!("[cosmo-rollback] plugin serializers: {names:?}"));
     crate::plugin_state::enable_all();
@@ -41,7 +45,9 @@ pub fn log_layout() {
     if DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    log("[cosmo-rollback] layout: entering");
     let rl = crate::ranges::engine_ranges();
+    log("[cosmo-rollback] layout: ranges resolved");
     log(&format!(
         "[cosmo-rollback] ranges: {} ranges, {} bytes",
         rl.ranges.len(),

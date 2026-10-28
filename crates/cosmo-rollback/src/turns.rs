@@ -378,6 +378,38 @@ impl InputTable {
         self.frontier
     }
 
+    /// Whether any turn (contiguous or not) has arrived for `storm`.
+    pub fn slot_has_any(&self, storm: usize) -> bool {
+        self.slots
+            .get(storm)
+            .map(|s| s.turns.iter().any(|t| t.bytes.is_some()))
+            .unwrap_or(false)
+    }
+
+    /// Fast-forwards the table past `step` steps the engine already ran itself (the
+    /// lockstep-pending phase before the client took over driving): every step before
+    /// `step` is treated as known and dispatched-as-run, and turns for them are dropped.
+    /// The table's step numbers are turn numbers, so the caller must pass the engine's
+    /// per-network-step turn count, not a frame count.
+    pub fn advance_to(&mut self, step: u32) {
+        if step <= self.frontier {
+            return;
+        }
+        for s in &mut self.slots {
+            let keep_from = s.first.max(step);
+            let drop = (keep_from - s.first) as usize;
+            s.turns.drain(..drop.min(s.turns.len()));
+            s.first = keep_from;
+            s.usable = s.usable.saturating_sub(drop);
+        }
+        if let Some(m) = self.mispredicted {
+            if m < step {
+                self.mispredicted = None;
+            }
+        }
+        self.frontier = self.frontier.max(step);
+    }
+
     /// The earliest step that ran on a prediction a turn has since contradicted, if any.
     pub fn mispredicted(&self) -> Option<u32> {
         self.mispredicted
