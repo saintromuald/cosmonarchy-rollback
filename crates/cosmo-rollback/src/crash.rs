@@ -40,6 +40,10 @@ unsafe extern "system" fn on_exception(info: *mut EXCEPTION_POINTERS) -> i32 {
         8 => "execute",
         _ => "?",
     };
+    log(&format!(
+        "[cosmo-rollback] UNHANDLED kind={kind} ({what}) touched={touched:#010x}: eip {:#010x}, esp {:#010x}, ebp {:#010x}",
+        ctx.Eip, ctx.Esp, ctx.Ebp
+    ));
 
     // The faulting frame's return addresses: the top of the stack is the cheapest backtrace
     // available from inside a handler without a symbol walker.
@@ -55,15 +59,9 @@ unsafe extern "system" fn on_exception(info: *mut EXCEPTION_POINTERS) -> i32 {
         (*record).ExceptionAddress as usize, ctx.Eip, ctx.Esp, ctx.Ebp
     ));
 
-    // Crash forensics: dump the regions that localise a poisoned dialog callback.
-    //  - ESI: the BinDlg element whose fxn_interact slot (0x2A) the engine called through
-    //  - exe 0x004190ED: the ui_button_click hook site (patched with an E9 jump by gptp)
-    //  - exe 0x005014AC: the engine's 15-entry default dialog interaction function table
-    //  - the fault address itself (the fetched page, usually NX data)
-    //
-    // Every read is guarded: the handler itself runs on the faulting thread, and a second
-    // fault inside the handler kills the dump (the gptp dialog crash has ESI == 0, which
-    // made the unguarded dump fault before it logged anything).
+    // Guarded byte dump: the handler runs on the faulting thread and a second fault here
+    // would kill the dump (the gptp dialog crash has ESI == 0, which made the unguarded
+    // dump fault before it logged anything).
     fn hexdump(name: &str, ptr: *const u8, len: usize) -> String {
         let mut s = String::new();
         s.push_str(&format!("[{name}]"));
@@ -95,6 +93,38 @@ unsafe extern "system" fn on_exception(info: *mut EXCEPTION_POINTERS) -> i32 {
         }
         s
     }
+
+    // The stack a few frames deep: the faulting frame's arguments and the caller's
+    // frame (the poisoned pointer usually comes from the caller, which sits just above).
+    log(&hexdump("stack_window", (ctx.Esp as usize).saturating_sub(0x40) as *const u8, 0x100));
+
+    // The faulting page's protection: distinguishes a poisoned pointer (the page is
+    // fine, the access is out of range) from a protection flip (the page itself lost
+    // READ/EXECUTE). VirtualQuery is cheap and never faults.
+    let mbi = {
+        let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
+            unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            windows_sys::Win32::System::Memory::VirtualQuery(
+                (*record).ExceptionAddress as *const core::ffi::c_void,
+                &mut mbi,
+                std::mem::size_of_val(&mbi),
+            )
+        };
+        if ok == 0 {
+            "[cosmo-rollback] crash: VirtualQuery failed".to_string()
+        } else {
+            format!(
+                "[cosmo-rollback] crash: page at {:#010x} base {:#010x} protect {:#x} state {:#x} type {:#x}",
+                (*record).ExceptionAddress as usize,
+                mbi.BaseAddress as usize,
+                mbi.Protect,
+                mbi.State,
+                mbi.Type,
+            )
+        }
+    };
+    log(&mbi);
     log(&hexdump("bin_dlg(esi)", ctx.Esi as *const u8, 0x40));
     log(&hexdump("eip_fault", (*record).ExceptionAddress as *const u8, 0x20));
     log(&hexdump("exe_ui_btn_click_hook", 0x0041_90E0 as *const u8, 0x24));
