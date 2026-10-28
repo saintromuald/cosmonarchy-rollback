@@ -55,9 +55,9 @@ start)
             export "$var"
         done
         # The wine sync backend (ntsync wedges after a kill-storm; esync works).
-        if [[ -n "${WINENT_SYNC:-}" ]]; then
-            export WINENT_SYNC
-        fi
+        for var in $(env | grep -o '^PROTON_[A-Z_]*'); do
+            export "$var"
+        done
         WINEPREFIX="$GAME_ROOT/prefix" PROTONPATH=GE-Proton \
         GAMEID="umu-cosmo-$NAME-$BUILD" PROTON_VERB=waitforexitandrun \
         DISPLAY="$DISPLAY_NUM" WAYLAND_DISPLAY= setsid umu-run "C:\\Cosmonarchy\\$BUILD\\Cosmonarchy BW.exe" \

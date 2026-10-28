@@ -58,7 +58,9 @@ pub fn engine_ranges() -> &'static RangeList {
 }
 
 fn build_ranges() -> RangeList {
+    crate::log::log("[cosmo-rollback] ranges: build_ranges begin");
     let mut rl = RangeList::default();
+    crate::log::log("[cosmo-rollback] ranges: default list ready");
 
     // Object pools / linked-list heads.
     //

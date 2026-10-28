@@ -54,6 +54,58 @@ unsafe extern "system" fn on_exception(info: *mut EXCEPTION_POINTERS) -> i32 {
         "[cosmo-rollback] UNHANDLED {code:#010x}: {what} at {:#010x}, eip {:#010x}, esp {:#010x}, ebp {:#010x}, stack:{frames}",
         (*record).ExceptionAddress as usize, ctx.Eip, ctx.Esp, ctx.Ebp
     ));
+
+    // Crash forensics: dump the regions that localise a poisoned dialog callback.
+    //  - ESI: the BinDlg element whose fxn_interact slot (0x2A) the engine called through
+    //  - exe 0x004190ED: the ui_button_click hook site (patched with an E9 jump by gptp)
+    //  - exe 0x005014AC: the engine's 15-entry default dialog interaction function table
+    //  - the fault address itself (the fetched page, usually NX data)
+    //
+    // Every read is guarded: the handler itself runs on the faulting thread, and a second
+    // fault inside the handler kills the dump (the gptp dialog crash has ESI == 0, which
+    // made the unguarded dump fault before it logged anything).
+    fn hexdump(name: &str, ptr: *const u8, len: usize) -> String {
+        let mut s = String::new();
+        s.push_str(&format!("[{name}]"));
+        if (ptr as usize) < 0x10000 || len == 0 {
+            s.push_str(" (addr too low to read)");
+            return s;
+        }
+        // IsBadReadPtr: TRUE when any byte in [ptr, ptr+len) is unreadable.
+        let bad = unsafe {
+            windows_sys::Win32::System::Memory::IsBadReadPtr(
+                ptr as *const core::ffi::c_void,
+                len as _,
+            )
+        };
+        if bad != 0 {
+            s.push_str(" (unreadable range)");
+            return s;
+        }
+        let mut off = 0usize;
+        while off < len {
+            let chunk = len.saturating_sub(off).min(16);
+            s.push_str(&format!("\n  +{off:04x}:"));
+            unsafe {
+                for i in 0..chunk {
+                    s.push_str(&format!(" {:02x}", *ptr.add(off + i)));
+                }
+            }
+            off += chunk;
+        }
+        s
+    }
+    log(&hexdump("bin_dlg(esi)", ctx.Esi as *const u8, 0x40));
+    log(&hexdump("eip_fault", (*record).ExceptionAddress as *const u8, 0x20));
+    log(&hexdump("exe_ui_btn_click_hook", 0x0041_90E0 as *const u8, 0x24));
+    log(&hexdump("exe_dlg_interaction_table", 0x0050_14A0 as *const u8, 0x48));
+    log(&hexdump("exe_490110", 0x0049_0110 as *const u8, 0x60));
+    for (name, base, size) in crate::modules::module_list() {
+        if name.to_ascii_lowercase().contains("gptp") {
+            log(&format!("[cosmo-rollback] crash: gptp base {base:#010x} size {size:#x}"));
+        }
+    }
+
     CONTINUE_SEARCH
 }
 
