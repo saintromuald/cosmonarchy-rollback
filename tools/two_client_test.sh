@@ -128,20 +128,38 @@ sleep "$BOOT"
 #   ->  Replay  ->  pick the LastReplay row (OCR)  ->  Ok
 # The old fixed click sequence no longer matches the menu (the profile chooser and
 # the single-player screens moved), so the row is located with ocr_row.py.
+#
+# The two displays are driven in PARALLEL: driving them sequentially (A's full
+# sequence first, then B's) starts A's game ~15 s before B's, so the guest is still
+# in the pending lockstep when the host flips — the host stalls at the prediction
+# limit and its peer-loss hand-back fires before the guest ever drives. Both games
+# must start within the arm margin of each other.
+step() { # display x y
+    local d="$1" x="$2" y="$3"
+    DISPLAY="$d" xdotool mousemove "$x" "$y" click 1 &
+}
 for d in :96 :95; do
-    DISPLAY="$d" xdotool key --clearmodifiers Return; sleep 5
-    DISPLAY="$d" xdotool mousemove 490 207 click 1; sleep 5
-    DISPLAY="$d" xdotool key --clearmodifiers Return; sleep 5
-    DISPLAY="$d" xdotool mousemove 200 652 click 1; sleep 6
+    DISPLAY="$d" xdotool key --clearmodifiers Return &
+done
+sleep 5
+for d in :96 :95; do step "$d" 490 207; done
+sleep 5
+for d in :96 :95; do DISPLAY="$d" xdotool key --clearmodifiers Return & done
+sleep 5
+for d in :96 :95; do step "$d" 200 652; done
+sleep 6
+for d in :96 :95; do
     DISPLAY="$d" import -window root "/tmp/opencode/tc-$d.png" 2>/dev/null
     ROW="$(python3 "$ROOT/tools/ocr_row.py" "/tmp/opencode/tc-$d.png" "$CL_REPLAY" 300 140 420 300 || true)"
     if [[ -n "$ROW" ]]; then
-        DISPLAY="$d" xdotool mousemove "${ROW% *}" "${ROW#* }" click 1; sleep 4
+        step "$d" "${ROW% *}" "${ROW#* }"
     else
         echo "warning: $CL_REPLAY row not found on $d (list: $(python3 "$ROOT/tools/ocr_text.py" "/tmp/opencode/tc-$d.png" 300 140 420 300 6 2>/dev/null | tr '\n' ' '))"
     fi
-    DISPLAY="$d" xdotool mousemove 887 558 click 1; sleep 6
 done
+sleep 4
+for d in :96 :95; do step "$d" 887 558; done
+sleep 6
 sleep "$POST"
 
 for r in "$A_ROOT" "$B_ROOT"; do WINEPREFIX="$r/prefix" wineserver -k 2>/dev/null; done

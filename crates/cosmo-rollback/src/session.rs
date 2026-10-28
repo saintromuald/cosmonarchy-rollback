@@ -60,6 +60,11 @@ pub struct Session {
     authority_turns: Option<[u32; crate::transport::SLOTS]>,
     /// The flip frame the host announced in the arming handshake, if any.
     arm_frame: Option<u32>,
+    /// The announced session fast-forward (0 while the host has not filled it in).
+    arm_delta: Option<u32>,
+    /// The earliest snapshot frame the ring holds (the flip fast-forward); rollback
+    /// restore targets are clamped to it.
+    earliest_snapshot: u32,
     /// Our own desync hash for each recently settled frame, so a peer's hash can be compared
     /// the moment it *arrives* — it may well arrive after we settled that frame.
     own_hashes: std::collections::VecDeque<(u32, u64)>,
@@ -114,6 +119,8 @@ impl Session {
             authority_lead: None,
             authority_turns: None,
             arm_frame: None,
+            arm_delta: None,
+            earliest_snapshot: 0,
             own_hashes: std::collections::VecDeque::new(),
             peer_reports: Vec::new(),
             sent: std::collections::VecDeque::new(),
@@ -179,11 +186,15 @@ impl Session {
                         self.peer_acked = Some(self.peer_acked.map_or(seq, |a| a.max(seq)));
                     }
                 }
-                Msg::Arm { frame } => {
-                    // The arming handshake: the host announces the flip frame. A later
-                    // announcement supersedes an earlier one (the host re-sends until the
-                    // flip, with a possibly updated frame).
+                Msg::Arm { frame, delta } => {
+                    // The arming handshake: the host announces the flip frame and the
+                    // session fast-forward. A later announcement supersedes an earlier
+                    // one (the host re-sends until the flip, with a possibly updated
+                    // frame and the delta filled in at the flip).
                     self.arm_frame = Some(self.arm_frame.map_or(frame, |f| f.max(frame)));
+                    if delta != 0 {
+                        self.arm_delta = Some(delta);
+                    }
                 }
                 Msg::LeadReport {
                     median_lateness,
@@ -209,6 +220,11 @@ impl Session {
     /// The flip frame the host announced in the arming handshake, if any.
     pub fn arm_frame(&self) -> Option<u32> {
         self.arm_frame
+    }
+
+    /// The session fast-forward the host announced alongside the flip frame.
+    pub fn arm_delta(&self) -> Option<u32> {
+        self.arm_delta
     }
 
     /// Whether any turn has been received from `slot` (the arming handshake's "the peer
@@ -315,10 +331,16 @@ impl Session {
             self.confirmed,
             self.table.mispredicted(),
             self.spacing,
+            self.earliest_snapshot,
         );
         self.resimulating = plan.restores(self.current);
         self.pending_rollback = plan.rollback_to;
         plan
+    }
+
+    /// The input table's misprediction mark (the earliest step a late turn contradicted).
+    pub fn table_mispredicted(&self) -> Option<u32> {
+        self.table.mispredicted()
     }
 
     /// The turn `frame` dispatches for every slot, to be injected before stepping it.
@@ -463,6 +485,7 @@ impl Session {
         self.table.advance_to(steps);
         self.current = self.current.max(steps);
         self.confirmed = self.confirmed.max(steps).min(self.current);
+        self.earliest_snapshot = steps;
     }
 
     /// Drains the peer hash reports that arrived since the last call, as `(slot, frame, hash)`
