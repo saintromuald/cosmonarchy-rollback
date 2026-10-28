@@ -82,6 +82,13 @@ fn build_ranges() -> RangeList {
     // Deterministic RNG.
     rl.add(RangeSpec::new("rng_seed", 0x0051CA14, 4));
     rl.add(RangeSpec::new("rng_enabled", 0x006D11C8, 4));
+    // The RNG call counters. Deliberately NOT compared (the wall-clock paths call the RNG
+    // too, so two clients' counts differ a frame out of phase — the shadow gate's
+    // original reason for excluding them), but they ARE snapshotted and restored: the
+    // rollback re-sim must resume the RNG from the exact call state or its rolls diverge
+    // from the live pass (the two-machine run's rng_seed divergence).
+    rl.add(RangeSpec::new("rng_call_counts", 0x0051C610, 4));
+    rl.add(RangeSpec::new("rng_call_counter", 0x0051CA18, 4));
 
     // AI.
     rl.add(RangeSpec::new("ai_regions", 0x0069A604, 8 * 4));
